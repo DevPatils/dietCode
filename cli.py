@@ -1,8 +1,10 @@
-"""Entrypoint: python cli.py "task description"
+"""Entrypoint.
 
-Runs the agent against a Docker sandbox it creates and tears down. Use
---local to skip Docker and run on the host filesystem (development only --
-the agent can run arbitrary commands as you).
+    python cli.py                     interactive session
+    python cli.py "do the thing"      one shot, then exit
+
+Both run the same agent_loop against the same sandbox; the interactive path
+just keeps the container and the conversation alive between turns.
 """
 
 from __future__ import annotations
@@ -10,57 +12,30 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from typing import Any
 
 from dotenv import load_dotenv
+from rich.console import Console
 
 from agent.loop import DEFAULT_MAX_ITERATIONS, DEFAULT_MODEL, agent_loop, make_client
+from agent.repl import Session
 from agent.sandbox import DEFAULT_IMAGE, DockerExecutor, LocalExecutor, SandboxError
-
-DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
-GREEN, RED, YELLOW = "\033[32m", "\033[31m", "\033[33m"
+from agent.ui import Renderer, turn_footer, use_utf8_stdout
 
 
-def make_printer(quiet: bool) -> Any:
-    def on_event(event: str, payload: dict[str, Any]) -> None:
-        if quiet:
-            return
-        if event == "step_start":
-            print(f"\n{DIM}--- step {payload['step']}/{payload['max_steps']} ---{RESET}")
-        elif event == "assistant_text":
-            print(f"{payload['text']}")
-        elif event == "tool_call":
-            args = payload["arguments"]
-            if len(args) > 200:
-                args = args[:200] + "..."
-            print(f"{BOLD}> {payload['name']}{RESET} {DIM}{args}{RESET}")
-        elif event == "tool_result":
-            output = payload["output"]
-            colour = RED if output.startswith("Error:") else DIM
-            if len(output) > 500:
-                output = output[:500] + f"\n{DIM}... [truncated for display]{RESET}"
-            print(f"{colour}{output}{RESET}")
-        elif event == "recovered_tool_calls":
-            print(
-                f"{YELLOW}(model wrote {payload['count']} tool call(s) as text; "
-                f"recovered){RESET}"
-            )
-        elif event == "complete":
-            print(f"\n{GREEN}task_complete{RESET}: {payload['summary']}")
-        elif event == "stopped":
-            print(f"\n{YELLOW}model stopped without calling a tool{RESET}")
-        elif event == "max_iterations":
-            print(f"\n{RED}hit max iterations ({payload['step']}){RESET}")
-        elif event == "error":
-            print(f"\n{RED}error: {payload['message']}{RESET}")
-
-    return on_event
-
-
-def main(argv: list[str] | None = None) -> int:
-    load_dotenv()
-    parser = argparse.ArgumentParser(description="CLI coding agent")
-    parser.add_argument("task", help="what the agent should do")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="CLI coding agent. Run with no task for an interactive session."
+    )
+    parser.add_argument("task", nargs="?", help="what to do; omit for interactive mode")
+    parser.add_argument(
+        "--mount",
+        action="append",
+        metavar="HOSTDIR[:TARGET]",
+        help="bind-mount a host directory into the sandbox so files persist "
+        "(default target /workspace). Repeatable.",
+    )
     parser.add_argument(
         "--local",
         action="store_true",
@@ -68,51 +43,37 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--workdir", default=".", help="working dir for --local")
     parser.add_argument("--image", default=DEFAULT_IMAGE, help="sandbox container image")
-    parser.add_argument("--container", help="attach to an existing container instead of creating one")
     parser.add_argument(
-        "--mount",
-        action="append",
-        metavar="HOSTPATH[:CONTAINERPATH]",
-        help="bind-mount a host directory into the sandbox so edits persist "
-        "(default target /workspace). Repeatable.",
+        "--container", help="attach to an existing container instead of creating one"
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
+    parser.add_argument("--steps", action="store_true", help="show step separators")
     parser.add_argument("--quiet", action="store_true", help="only print the final result")
-    parser.add_argument("--json", action="store_true", help="print result metrics as JSON")
-    args = parser.parse_args(argv)
+    parser.add_argument("--json", action="store_true", help="print metrics as JSON")
+    return parser
 
-    try:
-        client = make_client()
-    except RuntimeError as exc:
-        print(f"{RED}{exc}{RESET}", file=sys.stderr)
-        return 2
 
-    try:
-        if args.local:
-            executor: Any = LocalExecutor(args.workdir)
-            if not args.quiet:
-                print(f"{YELLOW}running unsandboxed on the host in {args.workdir}{RESET}")
-        else:
-            mounts = [DockerExecutor.parse_mount(m) for m in (args.mount or [])]
-            if mounts and args.container:
-                print(
-                    f"{YELLOW}--mount is ignored when attaching to an existing "
-                    f"container{RESET}",
-                    file=sys.stderr,
-                )
-            executor = DockerExecutor(
-                image=args.image, container=args.container, mounts=mounts
-            )
-            if not args.quiet:
-                print(f"{DIM}sandbox: {executor.container}{RESET}")
-                for host, target in mounts:
-                    print(f"{YELLOW}mounted {host} -> {target} (edits persist){RESET}")
-    except SandboxError as exc:
-        print(f"{RED}sandbox error: {exc}{RESET}", file=sys.stderr)
-        print(f"{DIM}is Docker running? or use --local for host execution{RESET}", file=sys.stderr)
-        return 2
+def make_executor(args: argparse.Namespace, console: Console) -> tuple[Any, list]:
+    if args.local:
+        return LocalExecutor(args.workdir), []
 
+    mounts = [DockerExecutor.parse_mount(m) for m in (args.mount or [])]
+    if mounts and args.container:
+        console.print(
+            "[yellow]--mount is ignored when attaching to an existing container[/yellow]"
+        )
+        mounts = []
+    executor = DockerExecutor(
+        image=args.image, container=args.container, mounts=mounts
+    )
+    return executor, mounts
+
+
+def run_once(args: argparse.Namespace, executor: Any, client: Any) -> int:
+    console = Console(quiet=args.quiet and not args.json)
+    renderer = Renderer(console, show_steps=args.steps)
+    started = time.monotonic()
     try:
         result = agent_loop(
             args.task,
@@ -120,29 +81,61 @@ def main(argv: list[str] | None = None) -> int:
             client=client,
             model=args.model,
             max_iterations=args.max_iterations,
-            on_event=make_printer(args.quiet),
+            on_event=None if args.quiet else renderer.on_event,
         )
+    except KeyboardInterrupt:
+        renderer.close()
+        console.print("\n[yellow]interrupted[/yellow]")
+        return 130
     finally:
-        executor.close()
+        renderer.close()
 
     if args.json:
         print(json.dumps(result.metrics(), indent=2))
     elif args.quiet:
         print(result.summary or result.status)
     else:
-        m = result.metrics()
-        recovered = (
-            f", {m['recovered_tool_calls']} recovered from text"
-            if m["recovered_tool_calls"]
-            else ""
-        )
-        print(
-            f"\n{DIM}{m['status']} in {m['steps']} steps, {m['tool_calls']} tool calls "
-            f"({m['tool_errors']} errors{recovered}), {m.get('total_tokens', 0)} tokens{RESET}"
-        )
-
+        turn_footer(console, result, time.monotonic() - started)
     return 0 if result.ok else 1
 
 
+def main(argv: list[str] | None = None) -> int:
+    use_utf8_stdout()  # before anything prints; Windows consoles default to cp1252
+    load_dotenv()
+    args = build_parser().parse_args(argv)
+    console = Console()
+
+    try:
+        client = make_client()
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+
+    try:
+        executor, mounts = make_executor(args, console)
+    except SandboxError as exc:
+        console.print(f"[red]sandbox error: {exc}[/red]")
+        console.print("[dim]is Docker running? or use --local to run on the host[/dim]")
+        return 2
+
+    try:
+        if args.task:
+            return run_once(args, executor, client)
+        return Session(
+            executor,
+            client,
+            model=args.model,
+            max_iterations=args.max_iterations,
+            mounts=mounts,
+            local=args.local,
+            show_steps=args.steps,
+        ).run()
+    finally:
+        executor.close()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -390,6 +390,42 @@ def test_task_complete_with_malformed_arguments_still_completes(executor):
     assert result.status == "complete"
 
 
+# -- conversation history ---------------------------------------------------
+
+
+def test_history_is_continued_not_restarted(executor):
+    prior = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "first task"},
+        {"role": "assistant", "content": "did it"},
+    ]
+    client = FakeClient([turn(tool_call("task_complete", {"summary": "ok"}))])
+    result = agent_loop("second task", executor, client=client, history=prior)
+
+    sent = client.calls[0]
+    assert [m["content"] for m in sent[:3]] == ["sys", "first task", "did it"]
+    assert sent[3]["content"] == "second task"
+    assert result.status == "complete"
+
+
+def test_history_is_copied_not_mutated(executor):
+    """An interrupted turn must not leave the caller's transcript half-written
+    with tool calls that were never answered."""
+    prior = [{"role": "system", "content": "sys"}, {"role": "user", "content": "old"}]
+    snapshot = [dict(m) for m in prior]
+    client = FakeClient([turn(tool_call("task_complete", {"summary": "ok"}))])
+    agent_loop("new", executor, client=client, history=prior)
+    assert prior == snapshot
+
+
+def test_history_without_a_system_prompt_gets_one(executor):
+    client = FakeClient([turn(tool_call("task_complete", {"summary": "ok"}))])
+    agent_loop(
+        "task", executor, client=client, history=[{"role": "user", "content": "old"}]
+    )
+    assert client.calls[0][0]["role"] == "system"
+
+
 # -- metrics ----------------------------------------------------------------
 
 

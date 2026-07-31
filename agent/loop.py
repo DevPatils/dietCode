@@ -222,20 +222,29 @@ def agent_loop(
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     system_prompt: str = SYSTEM_PROMPT,
     tools: Sequence[dict[str, Any]] = TOOLS,
+    history: Sequence[dict[str, Any]] | None = None,
     extra_tool_handlers: dict[str, Callable[[dict[str, Any]], str]] | None = None,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> AgentResult:
     """Run the agent until it completes the task, stops, or runs out of steps.
+
+    `history` continues an earlier conversation -- pass a previous result's
+    `.messages` to give the agent memory of what it already did. It is copied,
+    not mutated, so an interrupted turn cannot leave the caller holding a
+    transcript with unanswered tool calls in it.
 
     `extra_tool_handlers` is the hook the stretch-goal spawn_subagent tool plugs
     into -- it needs to recurse into agent_loop, which tools.py must not import.
     """
     client = client or make_client()
     handlers = extra_tool_handlers or {}
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": task},
-    ]
+    if history:
+        messages = [dict(m) for m in history]
+        if not any(m.get("role") == "system" for m in messages):
+            messages.insert(0, {"role": "system", "content": system_prompt})
+    else:
+        messages = [{"role": "system", "content": system_prompt}]
+    messages.append({"role": "user", "content": task})
     usage = Usage()
     total_tool_calls = 0
     tool_errors = 0

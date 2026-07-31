@@ -38,10 +38,20 @@ the suite needs no API key and makes no network calls.
 ## Architecture
 
 ```
-cli.py ─┐
-        ├─> agent_loop ──> execute_tool ──> Executor ──> container
-tb run ─┘   agent/loop.py   agent/tools.py   agent/sandbox.py
+interactive ─┐   (agent/repl.py + agent/ui.py)
+one-shot   ──┼─> agent_loop ──> execute_tool ──> Executor ──> container
+tb run     ──┘   agent/loop.py   agent/tools.py   agent/sandbox.py
 ```
+
+`python cli.py` with no task argument enters the interactive session; with a task
+it runs once and exits. Interactive mode reuses one container and feeds the previous
+turn's `.messages` back in as `history` — that is the *only* behavioural difference.
+`history` is copied, not mutated, so an interrupted turn cannot leave the caller with
+a transcript containing unanswered tool calls (which the API rejects).
+
+**Rendering stays in `agent/ui.py`.** The loop emits events and never prints, so the
+benchmark adapter runs it with no console attached. Anything that makes `agent_loop`
+aware of a terminal breaks that.
 
 The load-bearing idea: **the CLI and the benchmark differ only in which `Executor` is
 passed to `agent_loop`.** [adapters/terminal_bench.py](adapters/terminal_bench.py)'s
@@ -101,6 +111,12 @@ These encode failures already hit; changing them will silently break runs.
   be reparsed as shell syntax. Cost: writes are capped by `ARG_MAX` (~1MB).
 - **`close()` only removes containers we created.** Tearing down a harness-owned
   container mid-benchmark fails the task.
+- **Never print a non-ASCII character without `glyph()`.** Windows consoles default to
+  cp1252; printing `→` raises `UnicodeEncodeError` mid-render and killed the first
+  interactive session outright. `cli.py` calls `use_utf8_stdout()` before anything
+  prints, and `ui.glyph()` falls back to ASCII when the encoding is narrow. The same
+  applies to rich's box-drawing: `banner()` picks `box.ASCII` from `ascii_only()`
+  rather than trusting rich's terminal detection.
 
 ## Constraints from the plan
 

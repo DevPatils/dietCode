@@ -18,6 +18,20 @@ Docker must be running.
 
 ## Usage
 
+Run with no arguments for an interactive session:
+
+```bash
+python cli.py --mount ./agent-work
+```
+
+One container and one conversation for the whole session — the agent remembers
+what it did on previous turns and the files it built are still there. Slash
+commands: `/help`, `/files`, `/cost`, `/sandbox`, `/clear` (forget the
+conversation, keep the files), `/exit`. Ctrl+C interrupts a turn without
+quitting.
+
+Or pass a task to run once and exit — used for scripting and the benchmark:
+
 ```bash
 python cli.py "write a python script that prints the first 20 primes and run it"
 ```
@@ -32,6 +46,7 @@ python cli.py --mount ./my-project "add a test for the parser and make it pass"
 
 | Flag | Meaning |
 | --- | --- |
+| `--steps` | show step separators |
 | `--mount HOSTDIR[:TARGET]` | bind-mount a host directory into the sandbox so the agent's files persist (default target `/workspace`). Repeatable |
 | `--local` | run on the host instead of Docker (no isolation — dev only) |
 | `--container NAME` | attach to an existing container instead of creating one |
@@ -57,10 +72,15 @@ needs no API key and makes no network calls.
 ## How it works
 
 ```
-cli.py ─┐
-        ├─> agent_loop ──> execute_tool ──> Executor ──> container
-tb run ─┘   (agent/loop.py)  (agent/tools.py)  (agent/sandbox.py)
+interactive ─┐
+one-shot   ──┼─> agent_loop ──> execute_tool ──> Executor ──> container
+tb run     ──┘   (agent/loop.py)  (agent/tools.py)  (agent/sandbox.py)
 ```
+
+All three entrypoints run the same loop. Interactive mode differs only in that
+it passes the previous turn's `messages` back in as `history` and reuses one
+container; rendering lives in `agent/ui.py` so the loop stays UI-free and the
+benchmark can run it with no console attached.
 
 `agent_loop` calls the model, executes whatever tools it asks for, feeds the
 results back, and repeats until `task_complete`, a turn with no tool calls, or
