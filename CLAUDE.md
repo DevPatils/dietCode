@@ -71,6 +71,21 @@ These encode failures already hit; changing them will silently break runs.
   mentions a tool — recovery is gated on the name matching a real tool and the arguments
   decoding as JSON. Tracked as `recovered_tool_calls`, separate from `tool_errors`,
   because it measures the model rather than the scaffold.
+- **`task_complete` batched with the work is deferred, not honoured.** Models routinely
+  emit the whole task — write, run, *and* `task_complete` — in one turn, declaring the
+  output verified before any tool result existed. Observed live: a run wrote bash into a
+  `.py` file, got a `SyntaxError`, and claimed success in the same breath. The loop now
+  runs every call in the batch, hands back the results, and requires `task_complete` on
+  its own turn. Bounded by `MAX_COMPLETION_DEFERRALS` so a model that always batches
+  still terminates. Never `return` mid-batch: it skips later calls and leaves their
+  `tool_call_id`s unanswered, corrupting the transcript.
+- **Tool schemas must be permissive where the dispatcher coerces.** Groq validates tool
+  arguments against `TOOLS` server-side and rejects the entire generation with a 400 —
+  a model sending `"timeout": "10"` killed a run, even though `_coerce_timeout` handles
+  it fine. Hence `timeout` accepts `["integer", "string"]`. When it happens anyway, the
+  400 body carries `failed_generation`, and `failed_generation_text` salvages the call
+  from it rather than losing the task. Only `code == "tool_use_failed"` is recovered;
+  other 400s (bad key, etc.) must still surface as errors.
 - **File tools go through the `Executor`, never the host filesystem.** Otherwise the
   benchmark agent reads the host while its shell acts in the container.
 - **Every `tool_call` must get a `tool` message with a matching `tool_call_id`**, or the

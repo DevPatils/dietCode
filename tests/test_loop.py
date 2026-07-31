@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from agent.loop import agent_loop
+from agent.loop import agent_loop, failed_generation_text
 from agent.sandbox import LocalExecutor
 from tests.fake_llm import ExplodingClient, FakeClient, tool_call, turn
 
@@ -111,6 +113,99 @@ def test_llm_error_returns_error_status(executor):
     assert "invalid api key" in result.summary
 
 
+def sdk_error(payload: dict) -> Exception:
+    """Build the exception the way the SDK does, from a raw HTTP body.
+
+    Hand-constructing it hid a real bug: openai>=2 unwraps the {"error": {...}}
+    envelope and exposes the inner dict as .body, so a test that supplies the
+    envelope passes while the live path fails.
+    """
+    import httpx
+    import openai
+
+    client = openai.OpenAI(api_key="x", base_url="https://api.groq.com/openai/v1")
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    response = httpx.Response(
+        400,
+        content=json.dumps(payload),
+        headers={"content-type": "application/json"},
+        request=request,
+    )
+    return client._make_status_error_from_response(response)
+
+
+TOOL_USE_FAILED = {
+    "error": {
+        "code": "tool_use_failed",
+        "message": "Failed to call a function.",
+        "failed_generation": (
+            '<function=write_file>{"path": "salvaged.txt", '
+            '"content": "recovered"}</function>'
+        ),
+    }
+}
+
+
+def test_server_side_schema_rejection_is_recovered(executor, tmp_path):
+    """Groq validates tool args against our schema and 400s on a mismatch,
+    killing the run. The body carries the rejected generation, so the call can
+    be salvaged from it."""
+    client = FakeClient(
+        [sdk_error(TOOL_USE_FAILED), turn(tool_call("task_complete", {"summary": "done"}))]
+    )
+    result = agent_loop("task", executor, client=client)
+
+    assert result.status == "complete"
+    assert result.recovered_tool_calls == 1
+    assert (tmp_path / "salvaged.txt").read_text() == "recovered"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        TOOL_USE_FAILED["error"],  # unwrapped, as openai>=2 exposes it
+        TOOL_USE_FAILED,  # full envelope, as the wire carries it
+    ],
+)
+def test_both_error_body_shapes_are_understood(body):
+    """Neither shape may silently disable recovery."""
+
+    class Exc(Exception):
+        pass
+
+    exc = Exc()
+    exc.body = body
+    assert "salvaged.txt" in (failed_generation_text(exc) or "")
+
+
+def test_the_exact_generation_groq_rejected_live():
+    """Verbatim from a real run -- note the `[]` between name and arguments."""
+    payload = {
+        "error": {
+            "code": "tool_use_failed",
+            "message": "Failed to call a function.",
+            "failed_generation": (
+                '<function=task_complete[]{"summary": "printed the first 20 primes"}'
+                "</function>"
+            ),
+        }
+    }
+    text = failed_generation_text(sdk_error(payload))
+    assert text is not None
+    from agent.tools import extract_tool_calls_from_text
+
+    calls = extract_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "task_complete"
+
+
+def test_unrelated_400s_are_not_swallowed(executor):
+    """Only tool_use_failed carries a recoverable generation."""
+    err = sdk_error({"error": {"code": "invalid_api_key", "message": "bad key"}})
+    result = agent_loop("task", executor, client=ExplodingClient(err))
+    assert result.status == "error"
+
+
 def test_transient_errors_are_retried(executor, monkeypatch):
     monkeypatch.setattr("agent.loop.time.sleep", lambda _: None)
     client = ExplodingClient(RuntimeError("rate limit exceeded (429)"))
@@ -197,6 +292,68 @@ def test_parallel_tool_calls_all_execute(executor, tmp_path):
     assert result.status == "complete"
     assert (tmp_path / "x.txt").read_text() == "1"
     assert (tmp_path / "y.txt").read_text() == "2"
+
+
+# -- task_complete batched with the work ------------------------------------
+
+
+def test_calls_after_task_complete_in_the_same_batch_still_run(executor, tmp_path):
+    """Returning mid-batch would skip them and leave their ids unanswered."""
+    result, _ = run(
+        [
+            turn(
+                tool_call("task_complete", {"summary": "done"}, call_id="a"),
+                tool_call("write_file", {"path": "after.txt", "content": "x"}, call_id="b"),
+            ),
+            turn(tool_call("task_complete", {"summary": "really done"})),
+        ],
+        executor,
+    )
+    assert (tmp_path / "after.txt").read_text() == "x"
+    answered = [m["tool_call_id"] for m in result.messages if m["role"] == "tool"]
+    assert "a" in answered and "b" in answered
+
+
+def test_batched_completion_is_deferred_until_results_are_seen(executor):
+    """The model cannot have verified output it had not received yet."""
+    result, _ = run(
+        [
+            turn(
+                tool_call("run_shell", {"command": "echo hi"}, call_id="a"),
+                tool_call("task_complete", {"summary": "verified the output"}, call_id="b"),
+            ),
+            turn(tool_call("task_complete", {"summary": "now actually verified"})),
+        ],
+        executor,
+    )
+    assert result.status == "complete"
+    assert result.steps == 2  # did not finish on the batched turn
+    assert result.summary == "now actually verified"
+    deferred = [m for m in result.messages if m.get("tool_call_id") == "b"]
+    assert "Not recorded yet" in deferred[0]["content"]
+
+
+def test_solo_task_complete_is_accepted_immediately(executor):
+    result, _ = run(
+        [
+            turn(tool_call("run_shell", {"command": "echo hi"})),
+            turn(tool_call("task_complete", {"summary": "done"})),
+        ],
+        executor,
+    )
+    assert result.status == "complete"
+    assert result.steps == 2
+
+
+def test_persistent_batching_still_terminates(executor):
+    """A model that always batches must not loop until max_iterations."""
+    batched = turn(
+        tool_call("run_shell", {"command": "echo hi"}),
+        tool_call("task_complete", {"summary": "done"}),
+    )
+    result, client = run([batched for _ in range(10)], executor, max_iterations=8)
+    assert result.status == "complete"
+    assert len(client.calls) == 3  # deferred twice, then accepted
 
 
 # -- malformed calls do not kill the run ------------------------------------

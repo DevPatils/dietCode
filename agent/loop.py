@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Callable, Sequence
 
 from .sandbox import Executor
@@ -23,6 +24,11 @@ DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 # Tight by default: Groq's free tier is ~1000 requests/day and a runaway loop
 # eats it in one sitting.
 DEFAULT_MAX_ITERATIONS = 12
+
+# How many times to bounce a task_complete that was batched with the work it
+# claims to have verified. Bounded so a model that always batches still
+# terminates instead of burning the daily request quota.
+MAX_COMPLETION_DEFERRALS = 2
 
 SYSTEM_PROMPT = """You are a command-line coding agent working inside a sandboxed \
 Linux container. You complete the user's task by calling tools.
@@ -134,6 +140,38 @@ def _tool_call_to_dict(call: Any) -> dict[str, Any]:
     }
 
 
+def failed_generation_text(exc: Exception) -> str | None:
+    """Pull the rejected text out of a Groq `tool_use_failed` 400.
+
+    Groq validates tool arguments against our schema server-side. When a model
+    sends the wrong type -- `"timeout": "10"` instead of `10` -- the request is
+    rejected outright and the run dies, even though our dispatcher would have
+    coerced it happily. The error body carries the generation it refused, so we
+    can recover the call from it instead of losing the task.
+    """
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return None
+    # The wire format is {"error": {...}}, but openai>=2 unwraps it and exposes
+    # the inner dict as .body. Accept either, since assuming one shape silently
+    # disables this whole path -- which is exactly what happened.
+    inner = body.get("error")
+    error = inner if isinstance(inner, dict) else body
+    if error.get("code") != "tool_use_failed":
+        return None
+    failed = error.get("failed_generation")
+    return failed if isinstance(failed, str) and failed.strip() else None
+
+
+def _synthetic_response(text: str) -> Any:
+    """Shape a rejected generation like a normal response so the loop's existing
+    text-recovery path handles it."""
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=text, tool_calls=None))],
+        usage=None,
+    )
+
+
 def _call_llm(
     client: Any,
     model: str,
@@ -158,6 +196,11 @@ def _call_llm(
             )
         except Exception as exc:  # noqa: BLE001 - SDK raises a wide range
             last_exc = exc
+
+            rejected = failed_generation_text(exc)
+            if rejected:
+                return _synthetic_response(rejected)
+
             message = str(exc).lower()
             transient = any(
                 token in message
@@ -197,6 +240,8 @@ def agent_loop(
     total_tool_calls = 0
     tool_errors = 0
     recovered_tool_calls = 0
+    deferrals = 0
+    last_summary = ""
 
     def emit(event: str, **payload: Any) -> None:
         if on_event:
@@ -271,6 +316,8 @@ def agent_loop(
             return result("stopped", content, step)
 
         tool_messages: list[dict[str, Any]] = []
+        completion: tuple[dict[str, Any], str] | None = None
+
         for call in calls:
             name = call["function"]["name"]
             arguments = call["function"]["arguments"]
@@ -285,13 +332,15 @@ def agent_loop(
                 if not err and args is not None:
                     raw_summary = args.get("summary", "")
                     summary = raw_summary if isinstance(raw_summary, str) else str(raw_summary)
-                # Answer the tool call before returning so `messages` stays a
-                # valid transcript that can be resumed or logged.
-                messages.append(
+                # Do not return here. Models batch task_complete together with
+                # the work in a single turn, and returning mid-batch would skip
+                # every call after it and leave their tool_call ids unanswered
+                # in the transcript.
+                completion = (call, summary)
+                tool_messages.append(
                     {"role": "tool", "tool_call_id": call["id"], "content": summary or "done"}
                 )
-                emit("complete", step=step, summary=summary)
-                return result("complete", summary, step)
+                continue
 
             if name in handlers:
                 from .tools import parse_arguments
@@ -316,5 +365,30 @@ def agent_loop(
 
         messages.extend(tool_messages)
 
+        if completion is not None:
+            call, summary = completion
+            # If task_complete arrived alone, the model has already seen the
+            # results it is judging and we take it at its word.
+            if len(calls) == 1 or deferrals >= MAX_COMPLETION_DEFERRALS:
+                emit("complete", step=step, summary=summary)
+                return result("complete", summary, step)
+
+            # Otherwise it declared success in the same breath as the work,
+            # before any of those results existed. Hand back the results and
+            # make it say so again. Bounded, so a model that always batches
+            # still finishes rather than burning the request quota.
+            deferrals += 1
+            last_summary = summary
+            for msg in tool_messages:
+                if msg["tool_call_id"] == call["id"]:
+                    msg["content"] = (
+                        "Not recorded yet: you called task_complete in the same "
+                        "turn as the tool calls above, so you had not seen their "
+                        "results when you claimed the task was done. Review the "
+                        "results, then call task_complete on its own if the task "
+                        "really is finished."
+                    )
+            emit("completion_deferred", step=step, summary=summary)
+
     emit("max_iterations", step=max_iterations)
-    return result("max_iterations_reached", "", max_iterations)
+    return result("max_iterations_reached", last_summary, max_iterations)

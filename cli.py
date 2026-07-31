@@ -69,6 +69,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workdir", default=".", help="working dir for --local")
     parser.add_argument("--image", default=DEFAULT_IMAGE, help="sandbox container image")
     parser.add_argument("--container", help="attach to an existing container instead of creating one")
+    parser.add_argument(
+        "--mount",
+        action="append",
+        metavar="HOSTPATH[:CONTAINERPATH]",
+        help="bind-mount a host directory into the sandbox so edits persist "
+        "(default target /workspace). Repeatable.",
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
     parser.add_argument("--quiet", action="store_true", help="only print the final result")
@@ -87,9 +94,20 @@ def main(argv: list[str] | None = None) -> int:
             if not args.quiet:
                 print(f"{YELLOW}running unsandboxed on the host in {args.workdir}{RESET}")
         else:
-            executor = DockerExecutor(image=args.image, container=args.container)
+            mounts = [DockerExecutor.parse_mount(m) for m in (args.mount or [])]
+            if mounts and args.container:
+                print(
+                    f"{YELLOW}--mount is ignored when attaching to an existing "
+                    f"container{RESET}",
+                    file=sys.stderr,
+                )
+            executor = DockerExecutor(
+                image=args.image, container=args.container, mounts=mounts
+            )
             if not args.quiet:
                 print(f"{DIM}sandbox: {executor.container}{RESET}")
+                for host, target in mounts:
+                    print(f"{YELLOW}mounted {host} -> {target} (edits persist){RESET}")
     except SandboxError as exc:
         print(f"{RED}sandbox error: {exc}{RESET}", file=sys.stderr)
         print(f"{DIM}is Docker running? or use --local for host execution{RESET}", file=sys.stderr)

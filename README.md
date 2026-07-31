@@ -22,8 +22,17 @@ Docker must be running.
 python cli.py "write a python script that prints the first 20 primes and run it"
 ```
 
+By default the agent works in a throwaway container, so **anything it writes is
+discarded when the run ends**. To keep the files, mount a directory — the agent
+stays sandboxed, but `/workspace` is now a real folder on your machine:
+
+```bash
+python cli.py --mount ./my-project "add a test for the parser and make it pass"
+```
+
 | Flag | Meaning |
 | --- | --- |
+| `--mount HOSTDIR[:TARGET]` | bind-mount a host directory into the sandbox so the agent's files persist (default target `/workspace`). Repeatable |
 | `--local` | run on the host instead of Docker (no isolation — dev only) |
 | `--container NAME` | attach to an existing container instead of creating one |
 | `--image IMAGE` | sandbox image (default `python:3.11-slim`) |
@@ -76,6 +85,16 @@ gets passed in, so both run identical tool code.
   `recovered_tool_calls` — it measures the model, not the scaffold.
 - **File tools go through the executor, not the host filesystem.** Otherwise the
   benchmark agent would read the host while its shell acts in the container.
+- **`task_complete` batched with the work gets deferred.** Models often emit
+  write + run + `task_complete` in a single turn, declaring the output verified
+  before a single tool result existed. One run wrote bash into a `.py` file, got
+  a `SyntaxError`, and claimed success in the same breath — it would have scored
+  a false pass. The loop now feeds the results back and requires
+  `task_complete` on its own turn.
+- **Schemas stay permissive where the dispatcher coerces.** Groq validates tool
+  arguments server-side and 400s the whole generation on a mismatch; a model
+  sending `"timeout": "10"` killed a run. The rejected text comes back in
+  `failed_generation`, so the call is salvaged from it rather than lost.
 - **The shell wrapper persists the working directory** between calls. Each
   `docker exec` is a fresh process, so `cd /app` in one command would be silently
   lost by the next.

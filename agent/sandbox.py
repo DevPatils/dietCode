@@ -185,16 +185,41 @@ class DockerExecutor:
         container: str | None = None,
         workdir: str = "/workspace",
         user: str | None = None,
+        mounts: list[tuple[str, str]] | None = None,
     ):
         self.image = image
         self.workdir = workdir
         self.user = user
+        self.mounts = mounts or []
         self._owns_container = container is None
         self.container = container or f"cli-agent-{uuid.uuid4().hex[:12]}"
         if self._owns_container:
             self._start()
         else:
             self._require_running()
+
+    @staticmethod
+    def parse_mount(spec: str, default_target: str = "/workspace") -> tuple[str, str]:
+        """Parse HOSTPATH[:CONTAINERPATH].
+
+        Windows paths make this fiddly: 'C:\\src' has a colon that is a drive
+        letter, not a separator. Split from the right, and only when what
+        follows looks like an absolute container path.
+        """
+        host, target = spec, default_target
+        if ":" in spec:
+            head, _, tail = spec.rpartition(":")
+            if head and tail.startswith("/"):
+                host, target = head, tail
+
+        resolved = Path(host).expanduser().resolve()
+        if not resolved.exists():
+            raise SandboxError(f"mount source does not exist: {host}")
+        if not resolved.is_dir():
+            raise SandboxError(f"mount source is not a directory: {host}")
+        # Docker Desktop accepts forward slashes on Windows; backslashes are
+        # parsed inconsistently across versions.
+        return str(resolved).replace("\\", "/"), target
 
     # -- container lifecycle ------------------------------------------------
 
@@ -207,17 +232,15 @@ class DockerExecutor:
 
     def _start(self) -> None:
         docker = self._docker_path()
-        proc = subprocess.run(
-            [
-                docker, "run", "-d", "--name", self.container,
-                "-w", self.workdir,
-                # No --rm: close() removes it, so a crash leaves the container
-                # inspectable instead of silently vanished.
-                self.image, "sleep", "infinity",
-            ],
-            capture_output=True,
-            timeout=300,
-        )
+        argv = [docker, "run", "-d", "--name", self.container, "-w", self.workdir]
+        for host, target in self.mounts:
+            argv += ["-v", f"{host}:{target}"]
+        argv += [
+            # No --rm: close() removes it, so a crash leaves the container
+            # inspectable instead of silently vanished.
+            self.image, "sleep", "infinity",
+        ]
+        proc = subprocess.run(argv, capture_output=True, timeout=300)
         if proc.returncode != 0:
             raise SandboxError(
                 f"could not start sandbox container from image {self.image!r}: "

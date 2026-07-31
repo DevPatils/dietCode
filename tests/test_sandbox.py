@@ -148,6 +148,70 @@ def test_docker_reading_a_directory_raises(docker_executor):
         docker_executor.read_file("/tmp")
 
 
+# -- bind mounts ------------------------------------------------------------
+
+
+def test_parse_mount_defaults_to_workspace(tmp_path):
+    host, target = DockerExecutor.parse_mount(str(tmp_path))
+    assert target == "/workspace"
+    assert host.endswith(tmp_path.name)
+    assert "\\" not in host  # docker wants forward slashes
+
+
+def test_parse_mount_explicit_target(tmp_path):
+    _host, target = DockerExecutor.parse_mount(f"{tmp_path}:/app")
+    assert target == "/app"
+
+
+def test_parse_mount_keeps_windows_drive_letter(tmp_path):
+    """'C:\\src' has a colon that is a drive letter, not a separator -- naive
+    splitting turns the whole path into the mount target."""
+    host, target = DockerExecutor.parse_mount(str(tmp_path.resolve()))
+    assert target == "/workspace"
+    if str(tmp_path)[1:2] == ":":  # only meaningful on Windows
+        assert host[1:2] == ":"
+
+
+def test_parse_mount_rejects_missing_source(tmp_path):
+    with pytest.raises(SandboxError):
+        DockerExecutor.parse_mount(str(tmp_path / "does-not-exist"))
+
+
+def test_parse_mount_rejects_a_file(tmp_path):
+    f = tmp_path / "a.txt"
+    f.write_text("x")
+    with pytest.raises(SandboxError):
+        DockerExecutor.parse_mount(str(f))
+
+
+@requires_docker
+def test_mounted_directory_persists_edits_to_the_host(tmp_path):
+    """The point of --mount: files outlive the container."""
+    (tmp_path / "existing.txt").write_text("from host", encoding="utf-8")
+    mount = DockerExecutor.parse_mount(str(tmp_path))
+
+    ex = DockerExecutor(image="python:3.11-slim", mounts=[mount])
+    try:
+        # The container sees what the host put there...
+        assert ex.read_file("/workspace/existing.txt") == "from host"
+        # ...and the host sees what the container writes.
+        ex.write_file("/workspace/made.py", "print('hello')\n")
+        assert ex.run_shell("python /workspace/made.py").stdout.strip() == "hello"
+    finally:
+        ex.close()
+
+    assert (tmp_path / "made.py").read_text(encoding="utf-8") == "print('hello')\n"
+
+
+@requires_docker
+def test_unmounted_container_leaves_no_trace(tmp_path):
+    """Without --mount, work is discarded when the container goes away."""
+    ex = DockerExecutor(image="python:3.11-slim")
+    ex.write_file("/workspace/ghost.txt", "x")
+    ex.close()
+    assert not (tmp_path / "ghost.txt").exists()
+
+
 @requires_docker
 def test_attaching_to_a_missing_container_raises():
     with pytest.raises(SandboxError):

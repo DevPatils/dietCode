@@ -65,7 +65,13 @@ TOOLS: list[dict[str, Any]] = [
                 "properties": {
                     "command": {"type": "string", "description": "Command to run."},
                     "timeout": {
-                        "type": "integer",
+                        # Deliberately accepts a string too. Groq validates tool
+                        # arguments against this schema server-side and rejects
+                        # the whole generation with a 400 on a mismatch -- and
+                        # models send "10" as often as 10. _coerce_timeout
+                        # normalizes it, so strictness here buys nothing and
+                        # costs whole runs.
+                        "type": ["integer", "string"],
                         "description": f"Seconds before the command is killed (default {DEFAULT_TIMEOUT}).",
                     },
                 },
