@@ -169,6 +169,119 @@ def test_everything_renders_on_a_cp1252_console(monkeypatch):
     buffer.getvalue().encode("cp1252")
 
 
+# -- error messages ---------------------------------------------------------
+
+
+def test_daily_quota_error_is_readable():
+    """The raw provider error is a wall of JSON with the point buried in it."""
+    from agent.ui import humanize_error
+
+    raw = (
+        "LLM call failed: Error code: 429 - {'error': {'message': 'Rate limit reached "
+        "for model `llama-3.3-70b-versatile` in organization `org_01k` service tier "
+        "`on_demand` on tokens per day (TPD): Limit 100000, Used 99510, Requested 779. "
+        "Please try again in 4m9.696s.', 'code': 'rate_limit_exceeded'}}"
+    )
+    headline, hint = humanize_error(raw)
+    assert headline == "daily token quota exhausted"
+    assert "99,510" in hint and "100,000" in hint
+    assert len(headline) < 60
+
+
+def test_per_minute_limit_reports_the_retry_delay():
+    from agent.ui import humanize_error
+
+    headline, hint = humanize_error(
+        "Error code: 429 - rate limit reached on tokens per minute, "
+        "please try again in 12.5s"
+    )
+    assert headline == "rate limited"
+    assert "12.5s" in hint
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("Error code: 401 - invalid api key", "API key rejected"),
+        ("Connection error while reaching host", "could not reach the API"),
+        ("model `nope` does not exist", "unknown model"),
+    ],
+)
+def test_common_failures_get_a_headline(raw, expected):
+    from agent.ui import humanize_error
+
+    assert humanize_error(raw)[0] == expected
+
+
+def test_unknown_errors_are_shown_but_bounded():
+    from agent.ui import humanize_error
+
+    headline, hint = humanize_error("something\nweird\n" + "x" * 500)
+    assert len(headline) <= 201
+    assert "\n" not in headline
+    assert hint == ""
+
+
+# -- startup screen ---------------------------------------------------------
+
+
+def test_logo_falls_back_to_ascii(monkeypatch):
+    import agent.ui as ui
+
+    monkeypatch.setattr(ui, "_glyphs", None)
+    monkeypatch.setattr(ui.sys, "stdout", io.TextIOWrapper(io.BytesIO(), encoding="cp1252"))
+    plain = ui.logo().plain
+    assert plain.strip()
+    plain.encode("cp1252")  # the block-drawing logo would raise here
+
+
+def test_banner_fits_one_line_per_fact(console):
+    from agent.ui import banner
+
+    long_path = "C:/Users/Someone/OneDrive/Desktop/Projects/dietCode/agent-work"
+    banner(console, "llama-3.3-70b", "cli-agent-abc123", [(long_path, "/workspace")], local=False)
+    using = [ln for ln in output(console).splitlines() if ln.startswith("Using:")]
+    assert len(using) == 1
+    assert len(using[0]) <= console.width
+
+
+def test_context_percent():
+    from agent.ui import context_percent
+
+    assert context_percent(0, 1000) == 100
+    assert context_percent(500, 1000) == 50
+    assert context_percent(2000, 1000) == 0  # clamped, never negative
+    assert context_percent(10, 0) == 100  # no budget configured
+
+
+def test_status_bar_shows_location_sandbox_and_model():
+    from agent.ui import sandbox_label, status_bar
+
+    bar = status_bar(
+        "~/proj", sandbox_label("c", [], local=False), "llama-3.3-70b", 73, width=90
+    )
+    assert "~/proj" in bar
+    assert "sandboxed" in bar
+    assert "llama-3.3-70b" in bar
+    assert "(73%)" in bar
+
+
+def test_unsandboxed_is_called_out_in_the_status_bar():
+    """The one state a user must never miss."""
+    from agent.ui import sandbox_label
+
+    assert "no sandbox" in sandbox_label(None, [], local=True)
+
+
+def test_status_bar_survives_a_narrow_terminal():
+    from agent.ui import sandbox_label, status_bar
+
+    bar = status_bar(
+        "x" * 30, sandbox_label("c", [], local=False), "some-long-model-name", 5, width=20
+    )
+    assert "(5%)" in bar  # no crash, no negative padding
+
+
 # -- Session ----------------------------------------------------------------
 
 

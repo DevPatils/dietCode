@@ -8,6 +8,7 @@ adapter can run the identical loop with no console attached at all.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from typing import Any
 
@@ -123,6 +124,44 @@ def describe_tool_call(name: str, arguments: Any) -> tuple[str, str]:
         return "done", str(args.get("summary", ""))
 
     return name, json.dumps(args, default=str)[:200]
+
+
+def humanize_error(message: str) -> tuple[str, str]:
+    """Turn an API error into a headline and a next step.
+
+    Raw provider errors arrive as a wall of JSON with the useful part buried in
+    the middle. Returns (headline, hint); hint may be empty.
+    """
+    text = message or "unknown error"
+    low = text.lower()
+
+    if "rate limit" in low or "429" in low:
+        used = re.search(r"Used (\d+)", text)
+        limit = re.search(r"Limit (\d+)", text)
+        retry = re.search(r"try again in ([0-9hms.]+)", text)
+        if "per day" in low or "tpd" in low:
+            headline = "daily token quota exhausted"
+            detail = (
+                f"used {int(used.group(1)):,} of {int(limit.group(1)):,} tokens today"
+                if used and limit
+                else "the free tier resets on a rolling 24h window"
+            )
+            return headline, f"{detail} — try a different model, or wait for the reset"
+        headline = "rate limited"
+        return headline, (
+            f"retry in {retry.group(1)}" if retry else "too many requests just now"
+        )
+
+    if "api key" in low or "authentication" in low or "401" in low:
+        return "API key rejected", "check GROQ_API_KEY in .env"
+    if "connection" in low or "timed out" in low or "timeout" in low:
+        return "could not reach the API", "network or provider issue; retried already"
+    if "model" in low and ("not found" in low or "does not exist" in low):
+        return "unknown model", "check --model"
+
+    # Unrecognised: show it, but keep it to one readable line.
+    flattened = " ".join(text.split())
+    return (flattened[:200] + "…") if len(flattened) > 200 else flattened, ""
 
 
 def collapse(output: str, max_lines: int = MAX_RESULT_LINES) -> str:
@@ -288,9 +327,115 @@ class Renderer:
 
     def _on_error(self, payload: dict[str, Any]) -> None:
         self._stop_status()
-        self.console.print(
-            f"\n[{FAIL}] {glyph('cross')} error [/{FAIL}] [red1]{payload['message']}[/red1]"
+        headline, hint = humanize_error(payload["message"])
+        self.console.print(f"\n[{FAIL}] {glyph('cross')} {headline} [/{FAIL}]")
+        if hint:
+            self.console.print(f"  [{MUTED}]{hint}[/{MUTED}]")
+
+
+# The wordmark, and a plain fallback for consoles that cannot draw blocks.
+_LOGO = r"""
+ ██████╗ ██╗███████╗████████╗ ██████╗ ██████╗ ██████╗ ███████╗
+ ██╔══██╗██║██╔════╝╚══██╔══╝██╔════╝██╔═══██╗██╔══██╗██╔════╝
+ ██║  ██║██║█████╗     ██║   ██║     ██║   ██║██║  ██║█████╗
+ ██║  ██║██║██╔══╝     ██║   ██║     ██║   ██║██║  ██║██╔══╝
+ ██████╔╝██║███████╗   ██║   ╚██████╗╚██████╔╝██████╔╝███████╗
+ ╚═════╝ ╚═╝╚══════╝   ╚═╝    ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
+""".strip("\n")
+
+_LOGO_ASCII = r"""
+  ___  _ ___ _____ ___ ___  ___  ___
+ |   \| | __|_   _/ __/ _ \|   \| __|
+ | |) | | _|  | || (_| (_) | |) | _|
+ |___/|_|___| |_| \___\___/|___/|___|
+""".strip("\n")
+
+# Bright at the top, deepening downwards. Reads as lit-from-above rather than a
+# flat block of red.
+_LOGO_RAMP = ["#ff8a80", "#ff5252", "#ff1744", "#e51230", "#c20e26", "#96091d"]
+
+
+def logo() -> Text:
+    """The wordmark, coloured as a vertical gradient."""
+    art = _LOGO_ASCII if ascii_only() else _LOGO
+    text = Text()
+    for i, line in enumerate(art.splitlines()):
+        text.append(line + "\n", style=_LOGO_RAMP[min(i, len(_LOGO_RAMP) - 1)])
+    return text
+
+
+def context_percent(used: int, budget: int) -> int:
+    """How much of the context budget is still free, as a percentage."""
+    if budget <= 0:
+        return 100
+    return max(0, min(100, round((1 - used / budget) * 100)))
+
+
+def status_bar(
+    location: str,
+    sandbox: str,
+    model: str,
+    context_left: int,
+    width: int = 80,
+) -> str:
+    """The pinned bottom line: where you are, how isolated you are, what is
+    driving it. Raw ANSI because prompt_toolkit renders this, not rich."""
+    esc = "\x1b["
+    dim, red, orange, green, reset = (
+        f"{esc}38;5;244m",
+        f"{esc}38;5;203m",
+        f"{esc}38;5;208m",
+        f"{esc}38;5;114m",
+        f"{esc}0m",
+    )
+    # Green while there is room, orange as it tightens, red when trimming is
+    # imminent -- the number matters most exactly when it is small.
+    ctx_colour = green if context_left > 50 else orange if context_left > 20 else red
+    left = f"{dim}{location}{reset}"
+    middle = sandbox
+    right = f"{dim}{model}{reset} {ctx_colour}({context_left}%){reset}"
+
+    plain_len = len(location) + len(_strip_ansi(sandbox)) + len(model) + len(f" ({context_left}%)")
+    gap = max(2, (width - plain_len) // 2)
+    return f" {left}{' ' * gap}{middle}{' ' * gap}{right}"
+
+
+def _strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def sandbox_label(container: str | None, mounts: list[tuple[str, str]], local: bool) -> str:
+    """Isolation state, in the colour it deserves."""
+    esc = "\x1b["
+    red, orange, green, reset = (
+        f"{esc}38;5;203m",
+        f"{esc}38;5;208m",
+        f"{esc}38;5;114m",
+        f"{esc}0m",
+    )
+    if local:
+        return f"{red}no sandbox{reset}"
+    if mounts:
+        return f"{green}sandboxed{reset} {orange}+ mounted{reset}"
+    return f"{green}sandboxed{reset}"
+
+
+def tips(console: Console, mounts: list[tuple[str, str]], local: bool) -> None:
+    console.print(f"[{NOTE}]Tips for getting started:[/{NOTE}]")
+    lines = [
+        "Describe a task — it writes files and runs commands to finish it.",
+        "Be specific. It works in a container, so it can install and test freely.",
+        f"[{TOOL}]/help[/{TOOL}] for commands, [{TOOL}]/exit[/{TOOL}] to quit.",
+    ]
+    for n, line in enumerate(lines, 1):
+        console.print(f"  [{MUTED}]{n}.[/{MUTED}] [{DETAIL}]{line}[/{DETAIL}]")
+
+    if not mounts and not local:
+        console.print(
+            f"  [{WARN}]![/{WARN}] [{WARN}]files are discarded on exit "
+            f"{glyph('dash')} restart with --mount DIR to keep them[/{WARN}]"
         )
+    console.print()
 
 
 def banner(
@@ -300,53 +445,36 @@ def banner(
     mounts: list[tuple[str, str]],
     local: bool,
 ) -> None:
-    lines = [
-        Text.from_markup(f"[{BRAND}]cli-agent[/{BRAND}]  [{MUTED}]{model}[/{MUTED}]")
-    ]
+    console.print()
+    console.print(logo())
+    console.print()
+    tips(console, mounts, local)
 
+    # "what am I attached to", in the spirit of the reference layout's
+    # "Using: 3 QWEN.md files" line.
+    facts: list[str] = []
     if local:
-        lines.append(
-            Text.from_markup(f"[{FAIL}] running on your machine, unsandboxed [/{FAIL}]")
-        )
+        facts.append(f"[{FAIL}] unsandboxed [/{FAIL}]")
     else:
-        lines.append(Text.from_markup(f"[{MUTED}]sandbox {sandbox}[/{MUTED}]"))
+        facts.append(f"[{MUTED}]container {sandbox[:22]}[/{MUTED}]")
+    for host, target in mounts:
+        # Keep it on one line: a wrapped header reads as a glitch.
+        shown = host if len(host) <= 30 else "..." + host[-27:]
+        facts.append(f"[{NOTE}]{target}[/{NOTE}] [{MUTED}]{glyph('arrow')} {shown}[/{MUTED}]")
+    separator = f" [{MUTED}]{glyph('dot')}[/{MUTED}] "
+    console.print(f"[{MUTED}]Using:[/{MUTED}] " + separator.join(facts), overflow="ellipsis", no_wrap=True)
+    console.print()
 
-    if mounts:
-        for host, target in mounts:
-            lines.append(
-                Text.from_markup(
-                    f"[{NOTE}]{target}[/{NOTE}] [{MUTED}]{glyph('arrow')}[/{MUTED}] "
-                    f"[{MUTED}]{host}[/{MUTED}]"
-                )
-            )
-        lines.append(Text.from_markup(f"[{MUTED}]files written there persist[/{MUTED}]"))
-    elif not local:
-        # They have lost files to this twice. Say it before the first turn.
-        lines.append(
-            Text.from_markup(
-                f"[{WARN}]no folder mounted {glyph('dash')} files are discarded on "
-                f"exit[/{WARN}]"
-            )
-        )
-        lines.append(
-            Text.from_markup(f"[{MUTED}]restart with --mount DIR to keep them[/{MUTED}]")
-        )
 
-    # Don't rely on rich's terminal detection for the border: we already know
-    # whether this console can carry box-drawing characters.
-    console.print(
-        Panel(
-            Group(*lines),
-            border_style=BORDER,
-            padding=(0, 2),
-            box=rich_box.ASCII if ascii_only() else rich_box.HEAVY,
-        )
-    )
-    dot = glyph("dot")
-    console.print(
-        f"[{MUTED}]/help for commands {dot} Ctrl+C interrupts a turn {dot} /exit to "
-        f"quit[/{MUTED}]\n"
-    )
+def input_rule(console: Console) -> None:
+    """The top edge of the input area, drawn just above the prompt.
+
+    Only the top edge on purpose: a full box would need a full-screen
+    prompt_toolkit application, which takes over the terminal and destroys
+    scrollback. Not worth losing scrollback for a border.
+    """
+    corner, line = ("+", "-") if ascii_only() else ("╭", "─")
+    console.print(f"[{BORDER}]{corner}{line * max(4, console.width - 2)}[/{BORDER}]")
 
 
 def turn_footer(console: Console, result: Any, elapsed: float) -> None:

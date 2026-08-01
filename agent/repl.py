@@ -14,7 +14,12 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
-from .loop import DEFAULT_CONTEXT_BUDGET, DEFAULT_MAX_ITERATIONS, agent_loop
+from .loop import (
+    DEFAULT_CONTEXT_BUDGET,
+    DEFAULT_MAX_ITERATIONS,
+    agent_loop,
+    estimate_tokens,
+)
 from .sandbox import SandboxError
 from .ui import (
     BRAND,
@@ -25,7 +30,11 @@ from .ui import (
     WARN,
     Renderer,
     banner,
+    context_percent,
     glyph,
+    input_rule,
+    sandbox_label,
+    status_bar,
     turn_footer,
 )
 
@@ -39,8 +48,8 @@ COMMANDS = {
 }
 
 
-def _read_input(console: Console) -> str:
-    """Prompt with history and arrow-key editing where possible.
+def _read_input(console: Console, status: str | None = None) -> str:
+    """Prompt with history, arrow-key editing, and a pinned status bar.
 
     Falls back to input() when prompt_toolkit is missing or stdin is not a
     terminal -- piping a script in must still work, and prompt_toolkit raises
@@ -55,10 +64,11 @@ def _read_input(console: Console) -> str:
 
             if not hasattr(_read_input, "_session"):
                 _read_input._session = PromptSession(history=InMemoryHistory())  # type: ignore[attr-defined]
-            # prompt_toolkit does its own rendering, so the colour is a raw
-            # escape rather than rich markup.
+            # prompt_toolkit renders these itself, so they are raw escapes
+            # rather than rich markup.
             return _read_input._session.prompt(  # type: ignore[attr-defined]
-                ANSI(f"\x1b[1;91m{marker}\x1b[0m ")
+                ANSI(f"\x1b[38;5;240m{glyph('bar')}\x1b[0m \x1b[1;91m{marker}\x1b[0m "),
+                bottom_toolbar=ANSI(status) if status else None,
             )
         except ImportError:
             pass
@@ -95,6 +105,31 @@ class Session:
         self.total_tokens = 0
         self.total_steps = 0
         self.turns = 0
+
+    def _status_bar(self) -> str:
+        """The pinned line under the input: where, how isolated, what model."""
+        if self.mounts:
+            location = self.mounts[0][0]
+        elif self.local:
+            location = str(getattr(self.executor, "workdir", "."))
+        else:
+            location = getattr(self.executor, "workdir", "/workspace")
+        location = str(location)
+        if len(location) > 34:
+            location = "..." + location[-31:]
+
+        # Context left is the honest number here: it is what decides when old
+        # turns start getting dropped.
+        used = estimate_tokens(self.history) if self.history else 0
+        return status_bar(
+            location=location,
+            sandbox=sandbox_label(
+                getattr(self.executor, "container", None), self.mounts, self.local
+            ),
+            model=self.model,
+            context_left=context_percent(used, self.context_budget),
+            width=self.console.width,
+        )
 
     # -- slash commands -----------------------------------------------------
 
@@ -219,8 +254,9 @@ class Session:
         )
 
         while True:
+            input_rule(self.console)
             try:
-                text = _read_input(self.console)
+                text = _read_input(self.console, status=self._status_bar())
             except (EOFError, KeyboardInterrupt):
                 self.console.print()
                 break
