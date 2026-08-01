@@ -27,6 +27,16 @@ from typing import Any
 from agent.loop import DEFAULT_MAX_ITERATIONS, DEFAULT_MODEL, agent_loop, make_client
 from agent.sandbox import DockerExecutor, SandboxError
 
+try:
+    # `tb` does not load .env, so without this every task fails identically on a
+    # missing key. Optional because the harness may run in its own isolated
+    # environment where python-dotenv is not installed.
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:  # pragma: no cover - depends on the harness's environment
+    pass
+
 try:  # only needed when actually running under the harness
     from terminal_bench.agents.base_agent import AgentResult, BaseAgent
     from terminal_bench.agents.failure_mode import FailureMode
@@ -173,7 +183,17 @@ class CliAgent(BaseAgent):
         try:
             logging_dir.mkdir(parents=True, exist_ok=True)
             (logging_dir / "metrics.json").write_text(
-                json.dumps({"instruction": instruction, **result.metrics()}, indent=2),
+                json.dumps(
+                    {
+                        "instruction": instruction,
+                        **result.metrics(),
+                        # The reason, not just the status. On an `error` the
+                        # summary holds the API failure; without it a failed
+                        # task is a dead end for diagnosis.
+                        "summary": result.summary,
+                    },
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
             (logging_dir / "transcript.json").write_text(

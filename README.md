@@ -181,21 +181,41 @@ a pair makes the API reject the whole request). Trimming applies to what is
 
 ## Benchmark
 
-Terminal-Bench needs **Python ≥ 3.12**; the agent itself runs on 3.11+. If your
-default interpreter is 3.11, install the harness separately:
+**The harness does not run on Windows.** Use WSL or Linux:
 
 ```bash
-py -3.13 -m pip install terminal-bench
+curl -LsSf https://astral.sh/uv/install.sh | sh   # uv brings its own Python 3.13
+uv tool install terminal-bench
+
+wsl bash scripts/benchmark.sh                 # hello-world
+wsl bash scripts/benchmark.sh broken-python   # a single task
+DATASET=terminal-bench-core==0.1.1 wsl bash scripts/benchmark.sh ""   # everything
 ```
 
-Then, with Docker running:
+Docker Desktop's WSL integration means WSL shares the same daemon — no second
+install. The agent itself is fine on Windows; only the harness is not.
 
-```bash
-tb run --dataset terminal-bench-core \
-       --agent-import-path adapters.terminal_bench:CliAgent \
-       --model llama-3.3-70b-versatile \
-       --task-id hello-world
-```
+<details>
+<summary>Four terminal-bench 0.2.18 problems this works around</summary>
+
+1. Its dataset downloader shells out to Unix `rm -rf .git`. Needs Git's
+   `usr/bin` on PATH, or just run it on Linux.
+2. `terminal-bench-core@head` points at `./tasks`, but the repo moved to
+   `harbor-framework/terminal-bench` and renamed that directory
+   `original-tasks/`. Pin `==0.1.1` (commit `91e10457b5`).
+3. **Windows blocker:** container paths are built with `pathlib.Path`, so `/tmp`
+   becomes `\tmp` and the run dies in `TmuxSession.__init__` with
+   `404 Could not find the file \tmp` — before the agent is ever called. The
+   `0.00%` this produces is not a score; check `total_input_tokens: null` in
+   `results.json` to tell "harness failed" from "agent failed".
+4. It finishes by printing `output_path.absolute()`, which calls `os.getcwd()`.
+   On a OneDrive-backed folder over WSL's drvfs that can throw *after* a
+   successful run. Passing an absolute `--output-path` avoids the call.
+
+</details>
+
+`tb` does not read `.env`; the adapter loads it itself, and the script exports
+the key as well in case the harness's isolated environment lacks python-dotenv.
 
 Use a fixed ~15–20 task subset while iterating — not the full suite, and not
 repeatedly. Groq's free tier is ~1,000 requests/day and each task burns one
@@ -206,14 +226,34 @@ logging directory; they are the input to the failure-mode table below.
 
 ### Results
 
-Not yet run — no scores to report.
+**Smoke test only so far — one task, which is not a score.**
+
+| Task | Result | Steps | Tokens | Notes |
+| --- | --- | --- | --- | --- |
+| `hello-world` | ✅ resolved | 3 | 1,806 | 1 tool call recovered from text |
+
+The full subset run is the next step. The table below stays empty until then
+rather than extrapolating from a single task.
 
 | | Resolution rate | Avg steps | Avg tokens |
 | --- | --- | --- | --- |
 | This agent | — | — | — |
 | Terminus (reference) | — | — | — |
 
-Failure mode breakdown: _pending first run._
+#### What the first pass showed
+
+Both defensive mechanisms earned their place immediately. From the transcript:
+
+- **Step 1's tool call arrived as prose**, not through the tool-calling API. The
+  recovered call is visible in the log as a synthesized id (`call_1_0`) with
+  empty content. Without `extract_tool_calls_from_text` the loop would have
+  stopped at step 1, `hello.txt` would never have been written, and the task
+  would have failed.
+- **Step 2 sent `"timeout": "30"`** as a string. That is exactly the payload
+  that previously drew a 400 and killed a run; the permissive schema absorbed it.
+
+One task on one model is a smoke test, so treat `recovered_tool_calls` as the
+interesting number here, not the pass.
 
 ## Status
 

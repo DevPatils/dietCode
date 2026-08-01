@@ -6,7 +6,13 @@ import json
 
 import pytest
 
-from agent.loop import agent_loop, failed_generation_text
+from agent.loop import (
+    MAX_LLM_RETRIES,
+    REQUEST_TIMEOUT,
+    agent_loop,
+    failed_generation_text,
+    make_client,
+)
 from agent.sandbox import LocalExecutor
 from tests.fake_llm import ExplodingClient, FakeClient, sdk_error, tool_call, turn
 
@@ -190,7 +196,42 @@ def test_transient_errors_are_retried(executor, monkeypatch):
     client = ExplodingClient(RuntimeError("rate limit exceeded (429)"))
     result = agent_loop("task", executor, client=client)
     assert result.status == "error"
-    assert client.attempts == 3  # retried, then gave up
+    assert client.attempts == MAX_LLM_RETRIES  # retried, then gave up
+
+
+def test_daily_quota_is_not_retried(executor, monkeypatch):
+    """Both are 429, but a per-day cap will not clear during the run. Retrying
+    it burns the clock and fails anyway -- observed on a benchmark run."""
+    monkeypatch.setattr("agent.loop.time.sleep", lambda _: None)
+    quota = ExplodingClient(
+        RuntimeError(
+            "Error code: 429 - Rate limit reached for model on tokens per day "
+            "(TPD): Limit 100000, Used 98279"
+        )
+    )
+    result = agent_loop("task", executor, client=quota)
+    assert result.status == "error"
+    assert quota.attempts == 1  # no point retrying until tomorrow
+    assert "per day" in result.summary
+
+
+def test_per_minute_limits_are_still_retried(executor, monkeypatch):
+    monkeypatch.setattr("agent.loop.time.sleep", lambda _: None)
+    burst = ExplodingClient(
+        RuntimeError("Error code: 429 - rate limit reached on tokens per minute (TPM)")
+    )
+    agent_loop("task", executor, client=burst)
+    assert burst.attempts == MAX_LLM_RETRIES
+
+
+def test_client_bounds_request_time_and_owns_its_retries(monkeypatch):
+    """The SDK defaults to a 600s timeout and its own retries; one hung request
+    would otherwise stall a benchmark task for ten minutes, and SDK retries
+    would silently multiply our backoff."""
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    client = make_client()
+    assert client.timeout == REQUEST_TIMEOUT
+    assert client.max_retries == 0
 
 
 # -- the loop actually does work -------------------------------------------

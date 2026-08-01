@@ -25,6 +25,15 @@ DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 # eats it in one sitting.
 DEFAULT_MAX_ITERATIONS = 12
 
+# Per-request ceiling. Long enough for a slow generation, short enough that a
+# wedged connection does not eat a benchmark task's whole time budget.
+REQUEST_TIMEOUT = float(os.environ.get("AGENT_REQUEST_TIMEOUT", "120"))
+
+# Connection blips are common when Docker is saturating the network pulling task
+# images -- observed live, two benchmark tasks died on the first call with zero
+# tokens spent. Four attempts with a longer backoff rides those out.
+MAX_LLM_RETRIES = 4
+
 # How many times to bounce a task_complete that was batched with the work it
 # claims to have verified. Bounded so a model that always batches still
 # terminates instead of burning the daily request quota.
@@ -110,7 +119,11 @@ class AgentResult:
         }
 
 
-def make_client(api_key: str | None = None, base_url: str = GROQ_BASE_URL) -> Any:
+def make_client(
+    api_key: str | None = None,
+    base_url: str = GROQ_BASE_URL,
+    timeout: float = REQUEST_TIMEOUT,
+) -> Any:
     """Groq speaks the OpenAI protocol, so the OpenAI SDK is the client."""
     from openai import OpenAI
 
@@ -120,7 +133,16 @@ def make_client(api_key: str | None = None, base_url: str = GROQ_BASE_URL) -> An
             "GROQ_API_KEY is not set. Put it in .env or export it. "
             "Get a free key at https://console.groq.com/keys"
         )
-    return OpenAI(api_key=key, base_url=base_url)
+    return OpenAI(
+        api_key=key,
+        base_url=base_url,
+        # The SDK defaults to a 600s timeout, so one hung request can stall a
+        # benchmark task for ten minutes and then fail anyway.
+        timeout=timeout,
+        # Retries are ours: _call_llm classifies the error and backs off, and
+        # the SDK retrying underneath would multiply the wait invisibly.
+        max_retries=0,
+    )
 
 
 def _tool_call_to_dict(call: Any) -> dict[str, Any]:
@@ -284,6 +306,18 @@ def is_context_error(exc: Exception) -> bool:
     )
 
 
+def is_quota_exhausted(exc: Exception) -> bool:
+    """A daily cap, as opposed to a per-minute burst limit.
+
+    Both arrive as 429, but they need opposite handling: a per-minute limit
+    clears in seconds and is worth backing off for, while a tokens-per-day cap
+    will not clear for hours. Retrying the latter just burns the clock and then
+    fails anyway -- which is exactly what happened to a benchmark run.
+    """
+    text = str(exc).lower()
+    return "per day" in text or "tpd" in text or "rpd" in text
+
+
 def _is_transient(exc: Exception) -> bool:
     """Whether retrying could plausibly help.
 
@@ -414,14 +448,14 @@ def _call_llm(
     *,
     stream: bool = False,
     on_text: Callable[[str], None] | None = None,
-    max_retries: int = 3,
+    max_retries: int = MAX_LLM_RETRIES,
 ) -> Completion:
     """One completion, with backoff on transient failures.
 
-    Rate limits are a normal condition on the free tier, not an error worth
-    ending a benchmark task over.
+    Rate limits and connection blips are normal conditions here, not errors
+    worth ending a benchmark task over.
     """
-    delay = 2.0
+    delay = 3.0
     last_exc: Exception | None = None
     include_usage = True
 
@@ -454,6 +488,11 @@ def _call_llm(
             if include_usage and "stream_options" in str(exc).lower():
                 include_usage = False
                 continue
+
+            # A daily cap will not clear during this run; fail immediately so
+            # the caller sees the reason instead of a timeout.
+            if is_quota_exhausted(exc):
+                raise
 
             if not _is_transient(exc) or attempt == max_retries - 1:
                 raise

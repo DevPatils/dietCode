@@ -24,10 +24,20 @@ terminal-bench requires ≥3.12 and is installed on 3.13. So:
 
 ```bash
 py -3.13 -m pytest tests/test_adapter.py   # adapter tests SKIP on 3.11 -- run them here
-py -3.13 -m pip install terminal-bench
-tb run --dataset terminal-bench-core --agent-import-path adapters.terminal_bench:CliAgent \
-       --model llama-3.3-70b-versatile --task-id hello-world
 ```
+
+**The benchmark harness does not run on Windows** — it builds container paths with
+`pathlib`, so `/tmp` becomes `\tmp` and it dies in `TmuxSession.__init__` before the
+agent is called. Run it from WSL via the wrapper, which encodes four separate
+0.2.18 workarounds (see the README's benchmark section):
+
+```bash
+wsl bash scripts/benchmark.sh                 # hello-world
+wsl bash scripts/benchmark.sh broken-python   # one task
+```
+
+A harness `0.00%` is ambiguous: check `total_input_tokens` in `results.json`. `null`
+means the harness failed before the agent ran, not that the agent failed.
 
 A green `python -m pytest` does **not** mean the adapter is tested — it skips silently
 on 3.11. Run the 3.13 command too before claiming the adapter works.
