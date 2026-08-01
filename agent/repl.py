@@ -14,9 +14,20 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
-from .loop import DEFAULT_MAX_ITERATIONS, agent_loop
+from .loop import DEFAULT_CONTEXT_BUDGET, DEFAULT_MAX_ITERATIONS, agent_loop
 from .sandbox import SandboxError
-from .ui import Renderer, banner, glyph, turn_footer
+from .ui import (
+    BRAND,
+    MUTED,
+    NOTE,
+    OUTPUT,
+    TOOL,
+    WARN,
+    Renderer,
+    banner,
+    glyph,
+    turn_footer,
+)
 
 COMMANDS = {
     "/help": "show this help",
@@ -39,14 +50,19 @@ def _read_input(console: Console) -> str:
     if sys.stdin.isatty():
         try:
             from prompt_toolkit import PromptSession
+            from prompt_toolkit.formatted_text import ANSI
             from prompt_toolkit.history import InMemoryHistory
 
             if not hasattr(_read_input, "_session"):
                 _read_input._session = PromptSession(history=InMemoryHistory())  # type: ignore[attr-defined]
-            return _read_input._session.prompt(f"{marker} ")  # type: ignore[attr-defined]
+            # prompt_toolkit does its own rendering, so the colour is a raw
+            # escape rather than rich markup.
+            return _read_input._session.prompt(  # type: ignore[attr-defined]
+                ANSI(f"\x1b[1;91m{marker}\x1b[0m ")
+            )
         except ImportError:
             pass
-    console.print(f"[bold]{marker}[/bold] ", end="")
+    console.print(f"[{BRAND}]{marker}[/{BRAND}] ", end="")
     return input()
 
 
@@ -60,13 +76,19 @@ class Session:
         mounts: list[tuple[str, str]] | None = None,
         local: bool = False,
         show_steps: bool = False,
+        stream: bool = True,
+        context_budget: int = DEFAULT_CONTEXT_BUDGET,
+        max_total_tokens: int | None = None,
     ):
+        self.context_budget = context_budget
+        self.max_total_tokens = max_total_tokens
         self.executor = executor
         self.client = client
         self.model = model
         self.max_iterations = max_iterations
         self.mounts = mounts or []
         self.local = local
+        self.stream = stream
         self.console = Console()
         self.renderer = Renderer(self.console, show_steps=show_steps)
         self.history: list[dict[str, Any]] | None = None
@@ -79,42 +101,53 @@ class Session:
     def _cmd_help(self) -> None:
         table = Table(show_header=False, box=None, padding=(0, 2))
         for name, description in COMMANDS.items():
-            table.add_row(f"[bold]{name}[/bold]", f"[dim]{description}[/dim]")
+            table.add_row(
+                f"[{TOOL}]{name}[/{TOOL}]", f"[{MUTED}]{description}[/{MUTED}]"
+            )
         self.console.print(table)
         self.console.print(
-            "[dim]Anything else is a task. The agent keeps its memory and its "
-            "files between turns.[/dim]\n"
+            f"[{MUTED}]Anything else is a task. The agent keeps its memory and its "
+            f"files between turns.[/{MUTED}]\n"
         )
 
     def _cmd_clear(self) -> None:
         self.history = None
-        self.console.print("[dim]conversation cleared; files and container kept[/dim]\n")
+        self.console.print(
+            f"[{NOTE}]conversation cleared; files and container kept[/{NOTE}]\n"
+        )
 
     def _cmd_files(self) -> None:
         try:
             result = self.executor.run_shell("ls -la")
         except SandboxError as exc:
-            self.console.print(f"[red]{exc}[/red]\n")
+            self.console.print(f"[red1]{exc}[/red1]\n")
             return
-        self.console.print(f"[dim]{result.stdout.strip() or '(empty)'}[/dim]\n")
+        self.console.print(
+            f"[{OUTPUT}]{result.stdout.strip() or '(empty)'}[/{OUTPUT}]\n"
+        )
 
     def _cmd_cost(self) -> None:
+        dot = glyph("dot")
         self.console.print(
-            f"[dim]{self.turns} turns · {self.total_steps} steps · "
-            f"{self.total_tokens:,} tokens[/dim]\n"
+            f"[{NOTE}]{self.turns} turns {dot} {self.total_steps} steps {dot} "
+            f"{self.total_tokens:,} tokens[/{NOTE}]\n"
         )
 
     def _cmd_sandbox(self) -> None:
         if self.local:
-            self.console.print("[yellow]running unsandboxed on the host[/yellow]\n")
+            self.console.print(f"[{WARN}]running unsandboxed on the host[/{WARN}]\n")
             return
-        self.console.print(f"[dim]container {self.executor.container}[/dim]")
+        self.console.print(f"[{MUTED}]container {self.executor.container}[/{MUTED}]")
         if self.mounts:
             for host, target in self.mounts:
-                self.console.print(f"[dim]{target} → {host} (persists)[/dim]")
+                self.console.print(
+                    f"[{NOTE}]{target}[/{NOTE}] [{MUTED}]{glyph('arrow')} {host} "
+                    f"(persists)[/{MUTED}]"
+                )
         else:
             self.console.print(
-                "[yellow]nothing mounted — files vanish when you exit[/yellow]"
+                f"[{WARN}]nothing mounted {glyph('dash')} files vanish when you "
+                f"exit[/{WARN}]"
             )
         self.console.print()
 
@@ -134,7 +167,8 @@ class Session:
         handler = handlers.get(command)
         if handler is None:
             self.console.print(
-                f"[red]unknown command {command}[/red] [dim]— /help for the list[/dim]\n"
+                f"[red1]unknown command {command}[/red1] "
+                f"[{MUTED}]{glyph('dash')} /help for the list[/{MUTED}]\n"
             )
         else:
             handler()
@@ -151,6 +185,9 @@ class Session:
                 client=self.client,
                 model=self.model,
                 max_iterations=self.max_iterations,
+                stream=self.stream,
+                context_budget=self.context_budget,
+                max_total_tokens=self.max_total_tokens,
                 history=self.history,
                 on_event=self.renderer.on_event,
             )
@@ -159,7 +196,9 @@ class Session:
             # tool calls that were never answered is rejected by the API on the
             # next request.
             self.renderer.close()
-            self.console.print("\n[yellow]interrupted — turn discarded[/yellow]\n")
+            self.console.print(
+                f"\n[{WARN}]interrupted {glyph('dash')} turn discarded[/{WARN}]\n"
+            )
             return
         finally:
             self.renderer.close()
@@ -198,15 +237,15 @@ class Session:
 
         if self.turns:
             self.console.print(
-                f"[dim]{self.turns} turns · {self.total_tokens:,} tokens this "
-                f"session[/dim]"
+                f"[{MUTED}]{self.turns} turns {glyph('dot')} {self.total_tokens:,} "
+                f"tokens this session[/{MUTED}]"
             )
         if self.mounts:
             for host, _target in self.mounts:
-                self.console.print(f"[dim]your files are in {host}[/dim]")
+                self.console.print(f"[{NOTE}]your files are in {host}[/{NOTE}]")
         elif not self.local:
             self.console.print(
-                "[yellow]files from this session were discarded with the "
-                "container[/yellow]"
+                f"[{WARN}]files from this session were discarded with the "
+                f"container[/{WARN}]"
             )
         return 0

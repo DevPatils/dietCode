@@ -95,6 +95,7 @@ _FAILURE_MODES = {
     "complete": "NONE",
     "stopped": "NONE",
     "max_iterations_reached": "AGENT_TIMEOUT",
+    "budget_exhausted": "AGENT_TIMEOUT",
     "error": "UNKNOWN_AGENT_ERROR",
 }
 

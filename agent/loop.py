@@ -30,6 +30,11 @@ DEFAULT_MAX_ITERATIONS = 12
 # terminates instead of burning the daily request quota.
 MAX_COMPLETION_DEFERRALS = 2
 
+# Prompt tokens allowed before the oldest turns get dropped. Well under
+# llama-3.3-70b's 128k window: the ceiling that bites first is Groq's
+# tokens-per-minute limit, not the model's context.
+DEFAULT_CONTEXT_BUDGET = int(os.environ.get("AGENT_CONTEXT_BUDGET", "48000"))
+
 SYSTEM_PROMPT = """You are a command-line coding agent working inside a sandboxed \
 Linux container. You complete the user's task by calling tools.
 
@@ -76,7 +81,8 @@ class Usage:
 
 @dataclass
 class AgentResult:
-    status: str  # complete | stopped | max_iterations_reached | error
+    # complete | stopped | max_iterations_reached | budget_exhausted | error
+    status: str
     summary: str = ""
     steps: int = 0
     tool_calls: int = 0
@@ -163,13 +169,241 @@ def failed_generation_text(exc: Exception) -> str | None:
     return failed if isinstance(failed, str) and failed.strip() else None
 
 
-def _synthetic_response(text: str) -> Any:
-    """Shape a rejected generation like a normal response so the loop's existing
-    text-recovery path handles it."""
-    return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=text, tool_calls=None))],
-        usage=None,
+def estimate_tokens(messages: Sequence[dict[str, Any]]) -> int:
+    """Rough token count for trimming decisions.
+
+    Deliberately not tiktoken: that is OpenAI's tokenizer, not Llama's, so it
+    would be precisely wrong rather than approximately right -- and this only
+    needs to decide *whether* to trim, not to bill anyone. ~4 chars per token
+    plus per-message overhead.
+    """
+    total = 0
+    for message in messages:
+        total += 4  # role and framing
+        content = message.get("content") or ""
+        total += len(content) // 4
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            total += len(function.get("name") or "") // 4
+            total += len(function.get("arguments") or "") // 4
+            total += 8
+    return total
+
+
+def _blocks(messages: Sequence[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Group messages into units that must be kept or dropped together.
+
+    An assistant message with tool_calls and the tool messages answering it are
+    atomic: dropping half a pair leaves a tool_call with no result (or a result
+    with no call), and the API rejects the whole request.
+    """
+    grouped: list[list[dict[str, Any]]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        block = [message]
+        index += 1
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            while index < len(messages) and messages[index].get("role") == "tool":
+                block.append(messages[index])
+                index += 1
+        grouped.append(block)
+    return grouped
+
+
+def trim_messages(
+    messages: Sequence[dict[str, Any]], budget: int
+) -> tuple[list[dict[str, Any]], int]:
+    """Drop the oldest turns until the transcript fits. Returns (messages, dropped).
+
+    Without this an interactive session grows until it exceeds the model's
+    context window, after which *every* subsequent request fails and the session
+    is unrecoverable.
+    """
+    messages = list(messages)
+    if estimate_tokens(messages) <= budget:
+        return messages, 0
+
+    system: list[dict[str, Any]] = []
+    rest = messages
+    if messages and messages[0].get("role") == "system":
+        system, rest = [messages[0]], messages[1:]
+
+    blocks = _blocks(rest)
+    kept: list[list[dict[str, Any]]] = []
+    total = estimate_tokens(system)
+
+    # Newest first: recent context is what the model needs to keep working.
+    for block in reversed(blocks):
+        cost = estimate_tokens(block)
+        if kept and total + cost > budget:
+            break
+        kept.insert(0, block)
+        total += cost
+
+    # A leading tool message would be an orphan once its assistant turn is gone.
+    while kept and kept[0] and kept[0][0].get("role") == "tool":
+        kept.pop(0)
+
+    dropped_blocks = len(blocks) - len(kept)
+    if dropped_blocks <= 0:
+        return messages, 0
+
+    dropped_messages = sum(len(b) for b in blocks[: len(blocks) - len(kept)])
+    note = [
+        {
+            "role": "user",
+            "content": (
+                f"[{dropped_messages} earlier messages were dropped to stay within "
+                f"the context limit. Re-read any file you need rather than relying "
+                f"on memory of it.]"
+            ),
+        }
+    ]
+    return [*system, *note, *[m for block in kept for m in block]], dropped_messages
+
+
+def is_context_error(exc: Exception) -> bool:
+    """Whether the request failed because the transcript no longer fits."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        inner = body.get("error")
+        error = inner if isinstance(inner, dict) else body
+        if error.get("code") == "context_length_exceeded":
+            return True
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "context_length_exceeded",
+            "context length",
+            "maximum context",
+            "too many tokens",
+            "reduce the length",
+        )
     )
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Whether retrying could plausibly help.
+
+    Prefers the SDK's typed exceptions and HTTP status over grepping the message
+    text -- string-matching an error body is how the tool_use_failed bug hid.
+    The text check stays as a fallback for non-SDK clients.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status == 429 or 500 <= status < 600
+
+    try:
+        import openai
+
+        if isinstance(
+            exc,
+            (
+                openai.RateLimitError,
+                openai.APIConnectionError,
+                openai.APITimeoutError,
+                openai.InternalServerError,
+            ),
+        ):
+            return True
+        if isinstance(exc, openai.APIStatusError):
+            return False  # a typed 4xx: retrying sends the same bad request
+    except ImportError:
+        pass
+
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in ("rate limit", "429", "timeout", "500", "502", "503", "overloaded")
+    )
+
+
+@dataclass
+class Completion:
+    """One model turn, however it arrived.
+
+    Streaming and non-streaming are normalized to this so the loop never has to
+    care which transport produced the turn.
+    """
+
+    content: str = ""
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    usage: Any = None
+
+
+def _from_response(response: Any) -> Completion:
+    message = response.choices[0].message
+    raw_calls = getattr(message, "tool_calls", None) or []
+    return Completion(
+        content=getattr(message, "content", None) or "",
+        tool_calls=[_tool_call_to_dict(c) for c in raw_calls],
+        usage=getattr(response, "usage", None),
+    )
+
+
+def _from_stream(stream: Any, on_text: Callable[[str], None] | None) -> Completion:
+    """Reassemble a streamed turn.
+
+    Tool calls arrive in fragments: the id and name usually land in the first
+    delta for that index, then the arguments accumulate across many. They are
+    keyed by index because several calls stream interleaved.
+    """
+    parts: list[str] = []
+    slots: dict[int, dict[str, str]] = {}
+    usage = None
+
+    for chunk in stream:
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage is not None:
+            usage = chunk_usage  # arrives in a final choice-less chunk
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            continue
+
+        text = getattr(delta, "content", None)
+        if text:
+            parts.append(text)
+            if on_text is not None:
+                on_text(text)
+
+        for raw in getattr(delta, "tool_calls", None) or []:
+            index = getattr(raw, "index", None)
+            if index is None:
+                index = len(slots)
+            slot = slots.setdefault(
+                index, {"id": "", "name": "", "arguments": "", "_last_name": ""}
+            )
+            call_id = getattr(raw, "id", None)
+            if call_id:
+                slot["id"] = call_id
+            function = getattr(raw, "function", None)
+            if function is None:
+                continue
+            name_delta = getattr(function, "name", None)
+            # Most providers send the name complete in the first delta; a few
+            # repeat it on every one. Accumulate so a genuinely chunked name
+            # survives, but skip an immediate repeat so it is not doubled.
+            if name_delta and name_delta != slot["_last_name"]:
+                slot["name"] += name_delta
+                slot["_last_name"] = name_delta
+            args_delta = getattr(function, "arguments", None)
+            if args_delta:
+                slot["arguments"] += args_delta
+
+    calls = [
+        {
+            "id": slot["id"],
+            "type": "function",
+            "function": {"name": slot["name"], "arguments": slot["arguments"]},
+        }
+        for _index, slot in sorted(slots.items())
+    ]
+    return Completion(content="".join(parts), tool_calls=calls, usage=usage)
 
 
 def _call_llm(
@@ -177,8 +411,11 @@ def _call_llm(
     model: str,
     messages: list[dict[str, Any]],
     tools: Sequence[dict[str, Any]],
+    *,
+    stream: bool = False,
+    on_text: Callable[[str], None] | None = None,
     max_retries: int = 3,
-) -> Any:
+) -> Completion:
     """One completion, with backoff on transient failures.
 
     Rate limits are a normal condition on the free tier, not an error worth
@@ -186,28 +423,42 @@ def _call_llm(
     """
     delay = 2.0
     last_exc: Exception | None = None
+    include_usage = True
+
     for attempt in range(max_retries):
         try:
-            return client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=list(tools),
-                tool_choice="auto",
-            )
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "tools": list(tools),
+                "tool_choice": "auto",
+            }
+            if stream:
+                kwargs["stream"] = True
+                if include_usage:
+                    # Without this a streamed turn reports no token usage at
+                    # all, which would blank the benchmark's token column.
+                    kwargs["stream_options"] = {"include_usage": True}
+            raw = client.chat.completions.create(**kwargs)
+            return _from_stream(raw, on_text) if stream else _from_response(raw)
+
         except Exception as exc:  # noqa: BLE001 - SDK raises a wide range
             last_exc = exc
 
             rejected = failed_generation_text(exc)
             if rejected:
-                return _synthetic_response(rejected)
+                return Completion(content=rejected)
 
-            message = str(exc).lower()
-            transient = any(
-                token in message
-                for token in ("rate limit", "429", "timeout", "500", "502", "503", "overloaded")
-            )
-            if not transient or attempt == max_retries - 1:
+            # Not every OpenAI-compatible server knows stream_options. Losing
+            # the token count is much better than losing the turn.
+            if include_usage and "stream_options" in str(exc).lower():
+                include_usage = False
+                continue
+
+            if not _is_transient(exc) or attempt == max_retries - 1:
                 raise
+            # A stream that failed part-way has already shown the user some
+            # text; retrying will repeat it. Rare enough to accept.
             time.sleep(delay)
             delay *= 2
     raise last_exc  # type: ignore[misc]
@@ -222,11 +473,19 @@ def agent_loop(
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     system_prompt: str = SYSTEM_PROMPT,
     tools: Sequence[dict[str, Any]] = TOOLS,
+    stream: bool = False,
+    context_budget: int = DEFAULT_CONTEXT_BUDGET,
+    max_total_tokens: int | None = None,
     history: Sequence[dict[str, Any]] | None = None,
     extra_tool_handlers: dict[str, Callable[[dict[str, Any]], str]] | None = None,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> AgentResult:
     """Run the agent until it completes the task, stops, or runs out of steps.
+
+    `stream` emits the reply token by token as `assistant_delta` events. It
+    defaults off: the benchmark has no console to stream to, and reassembling
+    tool calls from deltas is strictly more machinery to go wrong, so scored
+    runs take the simpler path. Human-facing callers turn it on.
 
     `history` continues an earlier conversation -- pass a previous result's
     `.messages` to give the agent memory of what it already did. It is copied,
@@ -272,19 +531,50 @@ def agent_loop(
         step = i + 1
         emit("step_start", step=step, max_steps=max_iterations)
 
-        try:
-            response = _call_llm(client, model, messages, tools)
-        except Exception as exc:  # noqa: BLE001
-            emit("error", message=str(exc))
-            return result("error", f"LLM call failed: {exc}", step)
+        completion = None
+        for context_attempt in range(2):
+            sent, dropped = trim_messages(messages, context_budget)
+            if dropped:
+                emit("context_trimmed", step=step, dropped=dropped, budget=context_budget)
+            try:
+                completion = _call_llm(
+                    client,
+                    model,
+                    sent,
+                    tools,
+                    stream=stream,
+                    on_text=(lambda text: emit("assistant_delta", step=step, text=text))
+                    if stream
+                    else None,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                # Our estimate is approximate, so the server can still say no.
+                # Shrink relative to what was actually sent, not to the budget:
+                # if the budget is far above the real size, halving it changes
+                # nothing and the retry sends the identical payload.
+                if context_attempt == 0 and is_context_error(exc):
+                    context_budget = max(2_000, estimate_tokens(sent) // 2)
+                    emit("context_trimmed", step=step, dropped=0, budget=context_budget)
+                    continue
+                emit("error", message=str(exc))
+                return result("error", f"LLM call failed: {exc}", step)
 
-        usage.add(getattr(response, "usage", None))
-        message = response.choices[0].message
-        raw_calls = getattr(message, "tool_calls", None) or []
-        calls = [_tool_call_to_dict(c) for c in raw_calls]
-        content = getattr(message, "content", None) or ""
+        if completion is None:  # pragma: no cover - loop always sets or returns
+            return result("error", "LLM call failed", step)
 
-        if content:
+        usage.add(completion.usage)
+        calls = completion.tool_calls
+        content = completion.content
+
+        if max_total_tokens and usage.total_tokens >= max_total_tokens:
+            # A hard spend ceiling. max_iterations bounds steps, not tokens, and
+            # a single step with a large tool result can be enormous.
+            emit("budget_exhausted", step=step, tokens=usage.total_tokens)
+            return result("budget_exhausted", content, step)
+
+        # When streaming, the text has already been delivered delta by delta.
+        if content and not stream:
             emit("assistant_text", step=step, text=content)
 
         # Open models sometimes write the tool call as prose instead of using

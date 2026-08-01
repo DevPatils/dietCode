@@ -8,13 +8,39 @@ Benchmarked against Terminal-Bench.
 
 ## Setup
 
+You need **Python 3.11+**, **Docker Desktop** (installed *and* running), and a
+free Groq API key from [console.groq.com/keys](https://console.groq.com/keys).
+
 ```bash
+git clone https://github.com/DevPatils/dietCode.git
+cd dietCode
 pip install -r requirements.txt
-cp .env.example .env        # then put your Groq key in it
+cp .env.example .env        # Windows: copy .env.example .env
 ```
 
-Get a free key at [console.groq.com/keys](https://console.groq.com/keys).
-Docker must be running.
+Put your key in `.env`:
+
+```
+GROQ_API_KEY=gsk_your_key_here
+```
+
+`.env` is gitignored — everyone runs on their own key. Then:
+
+```bash
+mkdir agent-work
+python cli.py --mount ./agent-work
+```
+
+The first run pulls the `python:3.11-slim` image (~150 MB), so it takes a
+moment; after that startup is about a second.
+
+**Troubleshooting**
+
+| Symptom | Cause |
+| --- | --- |
+| `GROQ_API_KEY is not set` | no `.env`, or the key line is blank |
+| `sandbox error: ...` / `is Docker running?` | Docker Desktop isn't started |
+| files disappear after a run | no `--mount` — see below |
 
 ## Usage
 
@@ -47,6 +73,12 @@ python cli.py --mount ./my-project "add a test for the parser and make it pass"
 | Flag | Meaning |
 | --- | --- |
 | `--steps` | show step separators |
+| `--no-stream` | wait for each reply instead of showing it as it is generated |
+| `--no-network` | cut the sandbox off from the network entirely |
+| `--max-tokens N` | hard spend ceiling per task |
+| `--context-budget N` | trim the oldest turns above this prompt size (default 48000) |
+| `--memory` / `--cpus` / `--pids-limit` | container resource caps (default 2g / 2 / 512) |
+| `--cleanup` | remove every leftover agent container and exit |
 | `--mount HOSTDIR[:TARGET]` | bind-mount a host directory into the sandbox so the agent's files persist (default target `/workspace`). Repeatable |
 | `--local` | run on the host instead of Docker (no isolation — dev only) |
 | `--container NAME` | attach to an existing container instead of creating one |
@@ -81,6 +113,13 @@ All three entrypoints run the same loop. Interactive mode differs only in that
 it passes the previous turn's `messages` back in as `history` and reuses one
 container; rendering lives in `agent/ui.py` so the loop stays UI-free and the
 benchmark can run it with no console attached.
+
+Replies stream token by token in both human-facing modes. `agent_loop(stream=…)`
+defaults to **off**, and the benchmark leaves it off deliberately: streaming
+means reassembling tool calls from fragments, which is strictly more machinery
+to go wrong, and a scored run gains nothing from output nobody watches. Both
+transports normalize to the same `Completion`, so the loop itself is identical
+either way.
 
 `agent_loop` calls the model, executes whatever tools it asks for, feeds the
 results back, and repeats until `task_complete`, a turn with no tool calls, or
@@ -120,6 +159,25 @@ gets passed in, so both run identical tool code.
   lost by the next.
 - **Written file content is base64'd over argv**, so nothing the model generates
   can be reinterpreted as shell syntax. Costs a ~1MB write ceiling (`ARG_MAX`).
+
+## Limits and isolation
+
+The agent runs shell commands an LLM wrote, so containers are capped by default:
+**2 GB memory, 2 CPUs, 512 PIDs**, plus `no-new-privileges`. The PID cap is what
+stops a fork bomb from wedging the Docker VM rather than just failing a command.
+
+Networking is **on** by default (the agent often needs `pip install`). Use
+`--no-network` for untrusted work — note that combined with `--mount`, a
+networked agent can read your mounted files and send them somewhere.
+
+Every container is labelled, and startup sweeps ones older than 6 hours left
+behind by a crash. `--cleanup` removes them all now. This matters because
+`close()` only runs on a clean exit — SIGKILL leaks a container otherwise.
+
+Long sessions trim their own history: above `--context-budget` tokens the oldest
+turns are dropped, always keeping tool calls and their results together (splitting
+a pair makes the API reject the whole request). Trimming applies to what is
+*sent*; the full transcript is still recorded.
 
 ## Benchmark
 

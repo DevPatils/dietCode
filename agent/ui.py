@@ -23,12 +23,14 @@ from .tools import parse_arguments
 # or arrow glyphs -- printing one raises UnicodeEncodeError and takes the whole
 # session down. Detect it once and fall back to ASCII rather than crash.
 _UNICODE = {
-    "tick": "✓", "cross": "✗", "circle": "○", "bullet": "•",
-    "arrow": "→", "prompt": "›", "dash": "—", "dot": "·", "ellipsis": "…",
+    "tick": "✓", "cross": "✗", "circle": "○", "bullet": "▪",
+    "arrow": "→", "prompt": "❯", "dash": "—", "dot": "·", "ellipsis": "…",
+    "bar": "│",
 }
 _ASCII = {
     "tick": "+", "cross": "x", "circle": "o", "bullet": "*",
     "arrow": "->", "prompt": ">", "dash": "-", "dot": "-", "ellipsis": "...",
+    "bar": "|",
 }
 _glyphs: dict[str, str] | None = None
 
@@ -67,6 +69,28 @@ def use_utf8_stdout() -> None:
 # still goes to the model -- this is only what the human sees.
 MAX_RESULT_LINES = 14
 MAX_RESULT_WIDTH = 2000
+
+# --- palette ----------------------------------------------------------------
+#
+# Red-forward. The catch with a red theme is that red is also the universal
+# "something broke" signal, so if chrome and errors share it, failures stop
+# registering. Resolved by reserving *reversed* red for anything that went
+# wrong -- it reads as an alarm even surrounded by red -- and giving the rest a
+# ramp from bright (live) to muted (background).
+#
+# Written as literal markup rather than a rich Theme so any Console renders it,
+# including ones tests construct themselves.
+BRAND = "bold bright_red"
+BORDER = "red3"
+MARKER = "bright_red"       # the bullet in front of a tool call
+TOOL = "bold #ff8080"       # the tool's name
+DETAIL = "#b06a6a"          # its arguments
+OUTPUT = "grey42"           # tool output, deliberately recessive
+NOTE = "#d75f5f"            # session chatter: mounts, costs, hints
+WARN = "orange3"            # recovered / deferred / trimmed: odd, not fatal
+OK = "bold bright_red"      # success; the tick carries the meaning
+FAIL = "bold white on red3"  # reversed, so it survives a red background
+MUTED = "grey37"
 
 
 def describe_tool_call(name: str, arguments: Any) -> tuple[str, str]:
@@ -123,6 +147,7 @@ class Renderer:
         self.console = console
         self.show_steps = show_steps
         self._status: Any = None
+        self._streaming = False
 
     # -- spinner ------------------------------------------------------------
 
@@ -133,25 +158,47 @@ class Renderer:
 
     def _start_status(self, label: str) -> None:
         self._stop_status()
-        self._status = self.console.status(f"[dim]{label}[/dim]", spinner="dots")
+        self._status = self.console.status(
+            f"[{DETAIL}]{label}[/{DETAIL}]", spinner="dots", spinner_style=MARKER
+        )
         self._status.start()
 
     def close(self) -> None:
+        self._end_stream()
         self._stop_status()
 
     # -- events -------------------------------------------------------------
 
+    def _end_stream(self) -> None:
+        """Close off a partial streamed line so the next output starts clean."""
+        if self._streaming:
+            self.console.print()
+            self._streaming = False
+
     def on_event(self, event: str, payload: dict[str, Any]) -> None:
+        if event != "assistant_delta":
+            self._end_stream()
         handler = getattr(self, f"_on_{event}", None)
         if handler is not None:
             handler(payload)
+
+    def _on_assistant_delta(self, payload: dict[str, Any]) -> None:
+        text = payload.get("text", "")
+        if not text:
+            return
+        self._stop_status()
+        self._streaming = True
+        # Raw, not markup: streamed fragments are arbitrary model text and a
+        # stray '[' would otherwise be parsed as a rich style tag.
+        self.console.print(text, end="", markup=False, highlight=False)
 
     def _on_step_start(self, payload: dict[str, Any]) -> None:
         if self.show_steps:
             self._stop_status()
             dash = glyph("dash")
             self.console.print(
-                f"[dim]{dash} step {payload['step']}/{payload['max_steps']} {dash}[/dim]"
+                f"[{MUTED}]{dash} step {payload['step']}/{payload['max_steps']} "
+                f"{dash}[/{MUTED}]"
             )
         self._start_status("thinking")
 
@@ -164,8 +211,8 @@ class Renderer:
     def _on_recovered_tool_calls(self, payload: dict[str, Any]) -> None:
         self._stop_status()
         self.console.print(
-            f"[yellow]![/yellow] [dim]model wrote {payload['count']} tool call(s) as "
-            f"text; recovered[/dim]"
+            f"[{WARN}]![/{WARN}] [{MUTED}]model wrote {payload['count']} tool call(s) "
+            f"as text; recovered[/{MUTED}]"
         )
 
     def _on_tool_call(self, payload: dict[str, Any]) -> None:
@@ -175,32 +222,36 @@ class Renderer:
             return  # rendered by _on_complete instead
         marker = glyph("bullet")
         self.console.print(
-            f"[bold cyan]{marker}[/bold cyan] [bold]{label}[/bold]  [dim]{detail}[/dim]"
+            f"[{MARKER}]{marker}[/{MARKER}] [{TOOL}]{label}[/{TOOL}]  "
+            f"[{DETAIL}]{detail}[/{DETAIL}]"
         )
         self._start_status("running")
 
     def _on_tool_result(self, payload: dict[str, Any]) -> None:
         self._stop_status()
         output = payload["output"]
-        failed = output.startswith("Error:") or output.startswith("exit_code: ") and not output.startswith("exit_code: 0")
+        failed = output.startswith("Error:") or (
+            output.startswith("exit_code: ") and not output.startswith("exit_code: 0")
+        )
         body = collapse(output)
         if not body.strip():
             return
-        style = "red" if failed else "dim"
+        style = "red1" if failed else OUTPUT
+        bar = glyph("bar")
         for line in body.splitlines():
-            self.console.print(f"  [{style}]{line}[/{style}]")
+            self.console.print(f"[{MUTED}]{bar}[/{MUTED}] [{style}]{line}[/{style}]")
 
     def _on_completion_deferred(self, payload: dict[str, Any]) -> None:
         self._stop_status()
         self.console.print(
-            "[yellow]![/yellow] [dim]claimed done in the same turn as the work; "
-            "asked it to check the results first[/dim]"
+            f"[{WARN}]![/{WARN}] [{MUTED}]claimed done in the same turn as the work; "
+            f"asked it to check the results first[/{MUTED}]"
         )
 
     def _on_complete(self, payload: dict[str, Any]) -> None:
         self._stop_status()
         summary = payload.get("summary") or "done"
-        self.console.print(f"\n[green]{glyph('tick')}[/green] {summary}")
+        self.console.print(f"\n[{OK}]{glyph('tick')}[/{OK}] [{NOTE}]{summary}[/{NOTE}]")
 
     def _on_stopped(self, payload: dict[str, Any]) -> None:
         self._stop_status()
@@ -208,19 +259,38 @@ class Renderer:
         # has already been printed. Only a silent stop is worth flagging.
         if not payload.get("text", "").strip():
             self.console.print(
-                f"\n[yellow]{glyph('circle')} stopped without doing anything[/yellow]"
+                f"\n[{WARN}]{glyph('circle')} stopped without doing anything[/{WARN}]"
             )
+
+    def _on_context_trimmed(self, payload: dict[str, Any]) -> None:
+        self._stop_status()
+        if not payload.get("dropped"):
+            return
+        self.console.print(
+            f"[{WARN}]![/{WARN}] [{MUTED}]dropped {payload['dropped']} old messages to "
+            f"stay within the context limit[/{MUTED}]"
+        )
+
+    def _on_budget_exhausted(self, payload: dict[str, Any]) -> None:
+        self._stop_status()
+        self.console.print(
+            f"\n[{FAIL}] {glyph('cross')} token budget spent "
+            f"({payload['tokens']:,}) [/{FAIL}] "
+            f"[{MUTED}]raise it with --max-tokens[/{MUTED}]"
+        )
 
     def _on_max_iterations(self, payload: dict[str, Any]) -> None:
         self._stop_status()
         self.console.print(
-            f"\n[red]{glyph('cross')} hit the {payload['step']}-step limit[/red] "
-            f"[dim](raise it with --max-iterations)[/dim]"
+            f"\n[{FAIL}] {glyph('cross')} hit the {payload['step']}-step limit [/{FAIL}] "
+            f"[{MUTED}]raise it with --max-iterations[/{MUTED}]"
         )
 
     def _on_error(self, payload: dict[str, Any]) -> None:
         self._stop_status()
-        self.console.print(f"\n[red]{glyph('cross')} {payload['message']}[/red]")
+        self.console.print(
+            f"\n[{FAIL}] {glyph('cross')} error [/{FAIL}] [red1]{payload['message']}[/red1]"
+        )
 
 
 def banner(
@@ -230,46 +300,52 @@ def banner(
     mounts: list[tuple[str, str]],
     local: bool,
 ) -> None:
-    lines = [Text.from_markup(f"[bold]cli-agent[/bold]  [dim]{model}[/dim]")]
+    lines = [
+        Text.from_markup(f"[{BRAND}]cli-agent[/{BRAND}]  [{MUTED}]{model}[/{MUTED}]")
+    ]
 
     if local:
         lines.append(
-            Text.from_markup("[red]running on your machine, unsandboxed[/red]")
+            Text.from_markup(f"[{FAIL}] running on your machine, unsandboxed [/{FAIL}]")
         )
     else:
-        lines.append(Text.from_markup(f"[dim]sandbox {sandbox}[/dim]"))
+        lines.append(Text.from_markup(f"[{MUTED}]sandbox {sandbox}[/{MUTED}]"))
 
     if mounts:
         for host, target in mounts:
             lines.append(
                 Text.from_markup(
-                    f"[green]{target}[/green] [dim]{glyph('arrow')}[/dim] {host}"
+                    f"[{NOTE}]{target}[/{NOTE}] [{MUTED}]{glyph('arrow')}[/{MUTED}] "
+                    f"[{MUTED}]{host}[/{MUTED}]"
                 )
             )
-        lines.append(Text.from_markup("[dim]files written there persist[/dim]"))
+        lines.append(Text.from_markup(f"[{MUTED}]files written there persist[/{MUTED}]"))
     elif not local:
         # They have lost files to this twice. Say it before the first turn.
         lines.append(
             Text.from_markup(
-                "[yellow]no folder mounted — files are discarded on exit[/yellow]"
+                f"[{WARN}]no folder mounted {glyph('dash')} files are discarded on "
+                f"exit[/{WARN}]"
             )
         )
-        lines.append(Text.from_markup("[dim]restart with --mount DIR to keep them[/dim]"))
+        lines.append(
+            Text.from_markup(f"[{MUTED}]restart with --mount DIR to keep them[/{MUTED}]")
+        )
 
     # Don't rely on rich's terminal detection for the border: we already know
     # whether this console can carry box-drawing characters.
     console.print(
         Panel(
             Group(*lines),
-            border_style="dim",
+            border_style=BORDER,
             padding=(0, 2),
-            box=rich_box.ASCII if ascii_only() else rich_box.ROUNDED,
+            box=rich_box.ASCII if ascii_only() else rich_box.HEAVY,
         )
     )
     dot = glyph("dot")
     console.print(
-        f"[dim]/help for commands {dot} Ctrl+C interrupts a turn {dot} /exit to quit"
-        f"[/dim]\n"
+        f"[{MUTED}]/help for commands {dot} Ctrl+C interrupts a turn {dot} /exit to "
+        f"quit[/{MUTED}]\n"
     )
 
 
@@ -282,8 +358,8 @@ def turn_footer(console: Console, result: Any, elapsed: float) -> None:
         f"{elapsed:.1f}s",
     ]
     if m["tool_errors"]:
-        bits.append(f"[red]{m['tool_errors']} errors[/red]")
+        bits.append(f"[red1]{m['tool_errors']} errors[/red1]")
     if m["recovered_tool_calls"]:
-        bits.append(f"[yellow]{m['recovered_tool_calls']} recovered[/yellow]")
-    separator = " %s " % glyph("dot")
-    console.print("[dim]%s[/dim]\n" % separator.join(bits))
+        bits.append(f"[{WARN}]{m['recovered_tool_calls']} recovered[/{WARN}]")
+    separator = f"[{MUTED}] %s [/{MUTED}]" % glyph("dot")
+    console.print(f"[{MUTED}]%s[/{MUTED}]\n" % separator.join(bits))

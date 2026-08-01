@@ -53,6 +53,22 @@ a transcript containing unanswered tool calls (which the API rejects).
 benchmark adapter runs it with no console attached. Anything that makes `agent_loop`
 aware of a terminal breaks that.
 
+**Streaming is opt-in (`stream=True`), and the benchmark deliberately leaves it off.**
+Streaming requires reassembling tool calls from fragments — more machinery to go wrong,
+for output no scored run watches. Both transports normalize to `Completion(content,
+tool_calls, usage)` in `_from_response` / `_from_stream`, so the loop body is transport-
+agnostic. When adding a field to a model turn, add it to `Completion` and to *both*
+constructors, or streamed runs silently lose it.
+
+Reassembly gotchas, each covered by a test in `tests/test_streaming.py`: tool-call
+fragments are keyed by `index` (several calls stream interleaved); the function name is
+accumulated but an immediate repeat is skipped, since some providers send the name whole
+in every delta and others chunk it; usage arrives in a final chunk with **no choices**,
+so a `continue` on empty choices before reading usage blanks the token column;
+`stream_options={"include_usage": True}` is not universally supported and falls back.
+When streaming, the loop emits `assistant_delta` and suppresses `assistant_text` —
+emitting both double-prints the reply.
+
 The load-bearing idea: **the CLI and the benchmark differ only in which `Executor` is
 passed to `agent_loop`.** [adapters/terminal_bench.py](adapters/terminal_bench.py)'s
 `SessionExecutor` subclasses `DockerExecutor` and overrides exactly one method,
@@ -110,7 +126,21 @@ These encode failures already hit; changing them will silently break runs.
   the wrapper script; file content is base64'd over argv. Nothing the model generates can
   be reparsed as shell syntax. Cost: writes are capped by `ARG_MAX` (~1MB).
 - **`close()` only removes containers we created.** Tearing down a harness-owned
-  container mid-benchmark fails the task.
+  container mid-benchmark fails the task. `close()` also only runs on a *clean* exit,
+  which is why every container carries a `com.dietcode.agent` label and startup calls
+  `sweep_orphans()`. The sweep is age-based (6h) on purpose: there is no reliable way to
+  tell whether the owning process is alive, and killing a container out from under a
+  running session is worse than leaving a stale one.
+- **Trimming must never split a tool_call from its tool result.** `trim_messages` groups
+  messages into atomic blocks via `_blocks()` for exactly this reason — half a pair makes
+  the API reject the entire request. It also drops any leading orphan `tool` message.
+  Trimming applies to what is *sent*; `result.messages` keeps the full transcript.
+- **On `context_length_exceeded`, shrink relative to what was actually sent**, not to the
+  configured budget. Halving a 48k budget when the real payload is 2k changes nothing and
+  the retry sends an identical request — that exact bug was caught by a test.
+- **Classify retryable errors by type and status, not message text** (`_is_transient`).
+  String-matching an error body is how the `tool_use_failed` bug hid; a typed 4xx must
+  never be retried.
 - **Never print a non-ASCII character without `glyph()`.** Windows consoles default to
   cp1252; printing `→` raises `UnicodeEncodeError` mid-render and killed the first
   interactive session outright. `cli.py` calls `use_utf8_stdout()` before anything

@@ -20,6 +20,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,20 @@ from typing import Protocol
 
 DEFAULT_TIMEOUT = 30
 DEFAULT_IMAGE = os.environ.get("SANDBOX_IMAGE", "python:3.11-slim")
+
+# Resource caps. The agent runs shell commands an LLM wrote, so a fork bomb or a
+# runaway `dd` is a normal Tuesday rather than an attack. Without these the
+# container can exhaust the host's Docker VM.
+DEFAULT_MEMORY = os.environ.get("SANDBOX_MEMORY", "2g")
+DEFAULT_PIDS_LIMIT = int(os.environ.get("SANDBOX_PIDS", "512"))
+DEFAULT_CPUS = os.environ.get("SANDBOX_CPUS", "2")
+
+# Every container we create is labelled so orphans can be found later. close()
+# only runs on a clean exit; a SIGKILL or a closed laptop leaves the container
+# running forever otherwise.
+CONTAINER_LABEL = "com.dietcode.agent"
+CREATED_LABEL = "com.dietcode.agent.created"
+DEFAULT_ORPHAN_AGE = 6 * 3600
 
 # Where the shell wrapper stashes the working directory between calls.
 CWD_STATE_FILE = "/tmp/.agent_cwd"
@@ -186,11 +201,19 @@ class DockerExecutor:
         workdir: str = "/workspace",
         user: str | None = None,
         mounts: list[tuple[str, str]] | None = None,
+        memory: str | None = DEFAULT_MEMORY,
+        pids_limit: int | None = DEFAULT_PIDS_LIMIT,
+        cpus: str | None = DEFAULT_CPUS,
+        network: str | None = None,
     ):
         self.image = image
         self.workdir = workdir
         self.user = user
         self.mounts = mounts or []
+        self.memory = memory
+        self.pids_limit = pids_limit
+        self.cpus = cpus
+        self.network = network
         self._owns_container = container is None
         self.container = container or f"cli-agent-{uuid.uuid4().hex[:12]}"
         if self._owns_container:
@@ -233,6 +256,25 @@ class DockerExecutor:
     def _start(self) -> None:
         docker = self._docker_path()
         argv = [docker, "run", "-d", "--name", self.container, "-w", self.workdir]
+
+        # Labels make orphans findable; see sweep_orphans().
+        argv += [
+            "--label", f"{CONTAINER_LABEL}=1",
+            "--label", f"{CREATED_LABEL}={int(time.time())}",
+        ]
+
+        if self.memory:
+            argv += ["--memory", self.memory, "--memory-swap", self.memory]
+        if self.pids_limit:
+            argv += ["--pids-limit", str(self.pids_limit)]
+        if self.cpus:
+            argv += ["--cpus", str(self.cpus)]
+        if self.network:
+            argv += ["--network", self.network]
+        # Blocks setuid escalation inside the container. Costs nothing here --
+        # the agent has no reason to gain privileges it was not started with.
+        argv += ["--security-opt", "no-new-privileges"]
+
         for host, target in self.mounts:
             argv += ["-v", f"{host}:{target}"]
         argv += [
@@ -247,6 +289,64 @@ class DockerExecutor:
                 f"{_decode(proc.stderr).strip()}"
             )
         self.run_shell(f"mkdir -p {shlex.quote(self.workdir)}")
+
+    @classmethod
+    def list_orphans(cls) -> list[tuple[str, int]]:
+        """Containers we created that are still around, with their age in
+        seconds. Best effort -- returns [] if docker is unreachable."""
+        try:
+            docker = cls._docker_path()
+            proc = subprocess.run(
+                [
+                    docker, "ps", "-a",
+                    "--filter", f"label={CONTAINER_LABEL}",
+                    "--format", "{{.ID}}\t{{.Labels}}",
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+        except (SandboxError, subprocess.SubprocessError, OSError):
+            return []
+        if proc.returncode != 0:
+            return []
+
+        now = int(time.time())
+        found: list[tuple[str, int]] = []
+        for line in _decode(proc.stdout).splitlines():
+            if "\t" not in line:
+                continue
+            container_id, labels = line.split("\t", 1)
+            created = now  # unlabelled: treat as brand new, never sweep
+            for label in labels.split(","):
+                key, _, value = label.partition("=")
+                if key.strip() == CREATED_LABEL:
+                    try:
+                        created = int(value)
+                    except ValueError:
+                        pass
+            found.append((container_id.strip(), max(0, now - created)))
+        return found
+
+    @classmethod
+    def sweep_orphans(cls, max_age_seconds: int = DEFAULT_ORPHAN_AGE) -> int:
+        """Remove containers we created that outlived their process.
+
+        Age-based rather than liveness-based: there is no reliable way to ask
+        whether the python process that owned a container is still alive, and
+        killing a container out from under a running session would be far worse
+        than leaving a stale one for a few hours. Pass 0 to remove all of them.
+        """
+        stale = [cid for cid, age in cls.list_orphans() if age >= max_age_seconds]
+        if not stale:
+            return 0
+        try:
+            docker = cls._docker_path()
+            subprocess.run(
+                [docker, "rm", "-f", *stale], capture_output=True, timeout=120
+            )
+        except (SandboxError, subprocess.SubprocessError, OSError):
+            return 0
+        return len(stale)
 
     def _require_running(self) -> None:
         docker = self._docker_path()

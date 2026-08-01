@@ -8,7 +8,7 @@ import pytest
 
 from agent.loop import agent_loop, failed_generation_text
 from agent.sandbox import LocalExecutor
-from tests.fake_llm import ExplodingClient, FakeClient, tool_call, turn
+from tests.fake_llm import ExplodingClient, FakeClient, sdk_error, tool_call, turn
 
 
 @pytest.fixture
@@ -111,27 +111,6 @@ def test_llm_error_returns_error_status(executor):
     result = agent_loop("task", executor, client=client)
     assert result.status == "error"
     assert "invalid api key" in result.summary
-
-
-def sdk_error(payload: dict) -> Exception:
-    """Build the exception the way the SDK does, from a raw HTTP body.
-
-    Hand-constructing it hid a real bug: openai>=2 unwraps the {"error": {...}}
-    envelope and exposes the inner dict as .body, so a test that supplies the
-    envelope passes while the live path fails.
-    """
-    import httpx
-    import openai
-
-    client = openai.OpenAI(api_key="x", base_url="https://api.groq.com/openai/v1")
-    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
-    response = httpx.Response(
-        400,
-        content=json.dumps(payload),
-        headers={"content-type": "application/json"},
-        request=request,
-    )
-    return client._make_status_error_from_response(response)
 
 
 TOOL_USE_FAILED = {
