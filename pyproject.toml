@@ -4,10 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dietcode"
-# Single-sourced from agent/__init__.py so the package version and the one
-# `dietcode --version` prints can never drift apart.
-dynamic = ["version"]
-description = "A CLI coding agent that writes and runs code in a sandbox."
+version = "0.1.0"
+description = "A CLI coding agent that writes and runs code in a Docker sandbox."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -52,9 +50,6 @@ dietcode = "agent.cli:entrypoint"
 # `adapters` is a real package, not a stray directory: the Terminal-Bench
 # harness imports adapters.terminal_bench:CliAgent by path.
 packages = ["agent", "adapters"]
-
-[tool.setuptools.dynamic]
-version = { attr = "agent.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
