@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from types import SimpleNamespace
-from typing import Any, Callable, Sequence
+from typing import Any
 
 from .sandbox import Executor
 from .tools import TOOLS, execute_tool, extract_tool_calls_from_text
@@ -124,14 +124,15 @@ def make_client(
     base_url: str = GROQ_BASE_URL,
     timeout: float = REQUEST_TIMEOUT,
 ) -> Any:
-    """Groq speaks the OpenAI protocol, so the OpenAI SDK is the client."""
+    """Every supported provider speaks the OpenAI protocol, so one client and a
+    different base_url covers all of them."""
     from openai import OpenAI
 
     key = api_key or os.environ.get("GROQ_API_KEY")
     if not key:
         raise RuntimeError(
-            "GROQ_API_KEY is not set. Put it in .env or export it. "
-            "Get a free key at https://console.groq.com/keys"
+            "No API key. Run `dietcode login` to save one, "
+            "or set an API key environment variable."
         )
     return OpenAI(
         api_key=key,
@@ -582,9 +583,14 @@ def agent_loop(
                     sent,
                     tools,
                     stream=stream,
-                    on_text=(lambda text: emit("assistant_delta", step=step, text=text))
-                    if stream
-                    else None,
+                    # step is bound as a default: a bare closure over the loop
+                    # variable would report whatever step the loop had reached
+                    # by the time the callback fired.
+                    on_text=(
+                        (lambda text, at=step: emit("assistant_delta", step=at, text=text))
+                        if stream
+                        else None
+                    ),
                 )
                 break
             except Exception as exc:  # noqa: BLE001

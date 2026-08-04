@@ -127,17 +127,47 @@ def test_close_never_touches_the_harness_container(session):
 
 
 def test_missing_api_key_is_reported_not_swallowed(session, tmp_path, monkeypatch):
-    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    """Otherwise every task in a run fails identically with no visible reason."""
+    import adapters.terminal_bench as adapter
+    from agent.auth import AuthError
+
+    monkeypatch.setattr(
+        adapter, "_credentials", lambda: (_ for _ in ()).throw(AuthError("no API key for Groq"))
+    )
     result = CliAgent().perform_task("do a thing", session, logging_dir=tmp_path)
     assert result.failure_mode.value == "unknown_agent_error"
-    assert "GROQ_API_KEY" in (tmp_path / "error.txt").read_text(encoding="utf-8")
+    assert "no API key" in (tmp_path / "error.txt").read_text(encoding="utf-8")
+
+
+def test_the_benchmark_uses_the_same_saved_login_as_the_cli(monkeypatch, tmp_path):
+    """`tb` does not load .env; requiring a per-shell export is easy to forget
+    and fails every task identically."""
+    import adapters.terminal_bench as adapter
+    from agent import auth
+
+    monkeypatch.setattr(auth, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(auth, "CREDENTIALS_FILE", tmp_path / "credentials.json")
+    monkeypatch.setattr(auth, "CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr(auth, "_keyring", lambda: None)
+    for spec in auth.PROVIDERS.values():
+        monkeypatch.delenv(spec.env_var, raising=False)
+    monkeypatch.delenv("DIETCODE_PROVIDER", raising=False)
+
+    auth.store_key("gemini", "AIza_saved")
+    auth.set_default_provider("gemini")
+
+    api_key, base_url = adapter._credentials()
+    assert api_key == "AIza_saved"
+    assert "generativelanguage" in base_url
 
 
 def test_completed_task_reports_tokens_and_no_failure(session, tmp_path, monkeypatch):
     from agent.loop import AgentResult as LoopResult
 
-    monkeypatch.setenv("GROQ_API_KEY", "test-key")
-    monkeypatch.setattr("adapters.terminal_bench.make_client", lambda: object())
+    monkeypatch.setattr(
+        "adapters.terminal_bench._credentials", lambda: ("test-key", "http://x/v1")
+    )
+    monkeypatch.setattr("adapters.terminal_bench.make_client", lambda **kw: object())
     monkeypatch.setattr(
         "adapters.terminal_bench.agent_loop",
         lambda *a, **k: LoopResult(
@@ -169,7 +199,10 @@ def test_completed_task_reports_tokens_and_no_failure(session, tmp_path, monkeyp
 def test_status_maps_to_failure_mode(session, monkeypatch, status, expected):
     from agent.loop import AgentResult as LoopResult
 
-    monkeypatch.setattr("adapters.terminal_bench.make_client", lambda: object())
+    monkeypatch.setattr(
+        "adapters.terminal_bench._credentials", lambda: ("test-key", "http://x/v1")
+    )
+    monkeypatch.setattr("adapters.terminal_bench.make_client", lambda **kw: object())
     monkeypatch.setattr(
         "adapters.terminal_bench.agent_loop",
         lambda *a, **k: LoopResult(status=status, usage={}),

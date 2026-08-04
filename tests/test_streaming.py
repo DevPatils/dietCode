@@ -15,11 +15,11 @@ from agent.loop import agent_loop
 from agent.sandbox import LocalExecutor
 from tests.fake_llm import (
     FakeChunk,
+    FakeClient,
     FakeDelta,
     FakeDeltaFunction,
     FakeDeltaToolCall,
     FakeStreamChoice,
-    FakeClient,
     tool_call,
     turn,
 )

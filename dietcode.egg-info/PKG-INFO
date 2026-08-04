@@ -1,3 +1,33 @@
+Metadata-Version: 2.4
+Name: dietcode
+Version: 0.1.0
+Summary: A CLI coding agent that writes and runs code in a sandbox.
+Author: DevPatils
+License: MIT
+Project-URL: Homepage, https://github.com/DevPatils/dietCode
+Project-URL: Repository, https://github.com/DevPatils/dietCode
+Keywords: agent,llm,cli,coding-agent,terminal-bench
+Classifier: Development Status :: 3 - Alpha
+Classifier: Environment :: Console
+Classifier: Intended Audience :: Developers
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: openai>=1.40.0
+Requires-Dist: rich>=13.0.0
+Requires-Dist: prompt_toolkit>=3.0.0
+Requires-Dist: keyring>=24.0.0
+Provides-Extra: dotenv
+Requires-Dist: python-dotenv>=1.0.0; extra == "dotenv"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: python-dotenv>=1.0.0; extra == "dev"
+Requires-Dist: ruff>=0.6.0; extra == "dev"
+Dynamic: license-file
+
 # CLI Coding Agent
 
 A command-line coding agent: an agentic loop with tool-calling that reads/writes

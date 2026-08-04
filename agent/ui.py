@@ -13,11 +13,14 @@ import sys
 from typing import Any
 
 from rich import box as rich_box
+from rich.cells import cell_len
 from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
+from . import __version__
 from .tools import parse_arguments
 
 # Windows consoles still default to cp1252, which cannot encode any of the box
@@ -355,13 +358,47 @@ _LOGO_ASCII = r"""
 _LOGO_RAMP = ["#ff8a80", "#ff5252", "#ff1744", "#e51230", "#c20e26", "#96091d"]
 
 
+def logo_lines() -> list[Text]:
+    """The wordmark as individual lines, so it can sit in a column."""
+    art = _LOGO_ASCII if ascii_only() else _LOGO
+    return [
+        Text(line, style=_LOGO_RAMP[min(i, len(_LOGO_RAMP) - 1)])
+        for i, line in enumerate(art.splitlines())
+    ]
+
+
 def logo() -> Text:
     """The wordmark, coloured as a vertical gradient."""
-    art = _LOGO_ASCII if ascii_only() else _LOGO
     text = Text()
-    for i, line in enumerate(art.splitlines()):
-        text.append(line + "\n", style=_LOGO_RAMP[min(i, len(_LOGO_RAMP) - 1)])
+    for line in logo_lines():
+        text.append_text(line)
+        text.append("\n")
     return text
+
+
+# cell_len, not len: rich measures some of these box/block glyphs as wider than
+# one column, and sizing the column with len() truncates the wordmark.
+LOGO_WIDTH = max(cell_len(line) for line in _LOGO.splitlines())
+
+
+def recent_activity(mounts: list[tuple[str, str]], limit: int = 3) -> list[str]:
+    """What the agent last left behind in the mounted folder.
+
+    Genuinely useful rather than decorative: it answers "did my files actually
+    land?" without leaving the prompt -- the question that cost real work here
+    more than once.
+    """
+    if not mounts:
+        return []
+    from pathlib import Path
+
+    try:
+        root = Path(mounts[0][0])
+        files = [p for p in root.iterdir() if p.is_file()]
+    except OSError:
+        return []
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return [f"{p.name}  ({p.stat().st_size:,}b)" for p in files[:limit]]
 
 
 def context_percent(used: int, budget: int) -> int:
@@ -378,8 +415,8 @@ def status_bar(
     context_left: int,
     width: int = 80,
 ) -> str:
-    """The pinned bottom line: where you are, how isolated you are, what is
-    driving it. Raw ANSI because prompt_toolkit renders this, not rich."""
+    """The pinned line under the input: shortcuts on the left, state on the
+    right. Raw ANSI because prompt_toolkit renders this, not rich."""
     esc = "\x1b["
     dim, red, orange, green, reset = (
         f"{esc}38;5;244m",
@@ -391,13 +428,16 @@ def status_bar(
     # Green while there is room, orange as it tightens, red when trimming is
     # imminent -- the number matters most exactly when it is small.
     ctx_colour = green if context_left > 50 else orange if context_left > 20 else red
-    left = f"{dim}{location}{reset}"
-    middle = sandbox
-    right = f"{dim}{model}{reset} {ctx_colour}({context_left}%){reset}"
 
-    plain_len = len(location) + len(_strip_ansi(sandbox)) + len(model) + len(f" ({context_left}%)")
-    gap = max(2, (width - plain_len) // 2)
-    return f" {left}{' ' * gap}{middle}{' ' * gap}{right}"
+    left = f"{dim}/help for commands{reset}"
+    right_plain = f"{location}  {_strip_ansi(sandbox)}  {model} ({context_left}%)"
+    right = (
+        f"{dim}{location}{reset}  {sandbox}  "
+        f"{dim}{model}{reset} {ctx_colour}({context_left}%){reset}"
+    )
+
+    gap = max(2, width - len("/help for commands") - len(right_plain) - 2)
+    return f" {left}{' ' * gap}{right} "
 
 
 def _strip_ansi(text: str) -> str:
@@ -420,22 +460,12 @@ def sandbox_label(container: str | None, mounts: list[tuple[str, str]], local: b
     return f"{green}sandboxed{reset}"
 
 
-def tips(console: Console, mounts: list[tuple[str, str]], local: bool) -> None:
-    console.print(f"[{NOTE}]Tips for getting started:[/{NOTE}]")
-    lines = [
-        "Describe a task — it writes files and runs commands to finish it.",
-        "Be specific. It works in a container, so it can install and test freely.",
-        f"[{TOOL}]/help[/{TOOL}] for commands, [{TOOL}]/exit[/{TOOL}] to quit.",
-    ]
-    for n, line in enumerate(lines, 1):
-        console.print(f"  [{MUTED}]{n}.[/{MUTED}] [{DETAIL}]{line}[/{DETAIL}]")
-
-    if not mounts and not local:
-        console.print(
-            f"  [{WARN}]![/{WARN}] [{WARN}]files are discarded on exit "
-            f"{glyph('dash')} restart with --mount DIR to keep them[/{WARN}]"
-        )
-    console.print()
+# Kept short so they fit the guide column without being cut mid-word.
+TIPS = [
+    "Describe a task, it runs until done.",
+    "Be specific; it can install & test.",
+    f"[{TOOL}]/help[/{TOOL}] for commands, [{TOOL}]/exit[/{TOOL}] to quit.",
+]
 
 
 def banner(
@@ -445,36 +475,192 @@ def banner(
     mounts: list[tuple[str, str]],
     local: bool,
 ) -> None:
-    console.print()
-    console.print(logo())
-    console.print()
-    tips(console, mounts, local)
+    left = _identity_block(model, sandbox, mounts, local)
+    right = _guide_block(mounts, local)
 
-    # "what am I attached to", in the spirit of the reference layout's
-    # "Using: 3 QWEN.md files" line.
-    facts: list[str] = []
-    if local:
-        facts.append(f"[{FAIL}] unsandboxed [/{FAIL}]")
+    # Two columns only when the guide column stays readable; stacked otherwise.
+    # A squeezed two-column layout is worse than an honest single one.
+    if _guide_width(console.width) >= 34:
+        body: Any = _side_by_side(left, right, console.width)
     else:
-        facts.append(f"[{MUTED}]container {sandbox[:22]}[/{MUTED}]")
-    for host, target in mounts:
-        # Keep it on one line: a wrapped header reads as a glitch.
-        shown = host if len(host) <= 30 else "..." + host[-27:]
-        facts.append(f"[{NOTE}]{target}[/{NOTE}] [{MUTED}]{glyph('arrow')} {shown}[/{MUTED}]")
-    separator = f" [{MUTED}]{glyph('dot')}[/{MUTED}] "
-    console.print(f"[{MUTED}]Using:[/{MUTED}] " + separator.join(facts), overflow="ellipsis", no_wrap=True)
+        body = Group(*left, Text(""), *right)
+
     console.print()
+    console.print(
+        Panel(
+            body,
+            title=f"[{BRAND}]dietcode[/{BRAND}] [{MUTED}]v{__version__}[/{MUTED}]",
+            title_align="left",
+            border_style=BORDER,
+            padding=(1, 2),
+            box=rich_box.ASCII if ascii_only() else rich_box.ROUNDED,
+        )
+    )
+
+    # The one-line notice under the panel, where Claude Code puts its news.
+    if local:
+        console.print(
+            f" [{WARN}]{glyph('arrow')}[/{WARN}] [{WARN}]unsandboxed: the model's "
+            f"shell commands run as you[/{WARN}]\n"
+        )
+    elif not mounts:
+        console.print(
+            f" [{WARN}]{glyph('arrow')}[/{WARN}] [{MUTED}]nothing mounted "
+            f"{glyph('dot')} files vanish on exit "
+            f"{glyph('dot')} use --mount DIR to keep them[/{MUTED}]\n",
+            no_wrap=True,
+            overflow="ellipsis",
+        )
+    else:
+        console.print(
+            f" [{NOTE}]{glyph('arrow')}[/{NOTE}] [{MUTED}]files land in "
+            f"{_shorten(mounts[0][0], max(20, console.width - 22))}[/{MUTED}]\n",
+            no_wrap=True,
+            overflow="ellipsis",
+        )
+
+
+def _shorten(text: str, width: int) -> str:
+    return text if len(text) <= width else "..." + text[-(width - 3) :]
+
+
+def _identity_block(
+    model: str, sandbox: str, mounts: list[tuple[str, str]], local: bool
+) -> list[Text]:
+    """Left column: the wordmark, then what this session actually is."""
+    lines: list[Text] = list(logo_lines())
+    lines.append(Text(""))
+
+    isolation = "unsandboxed" if local else "sandboxed"
+    lines.append(
+        Text.from_markup(
+            f"[{NOTE}]{model}[/{NOTE}] [{MUTED}]{glyph('dot')}[/{MUTED}] "
+            + (f"[{FAIL}] {isolation} [/{FAIL}]" if local else f"[{DETAIL}]{isolation}[/{DETAIL}]")
+        )
+    )
+    if not local:
+        lines.append(Text(f"container {sandbox[:26]}", style=MUTED))
+    for host, target in mounts:
+        lines.append(
+            Text.from_markup(
+                f"[{MUTED}]{target} {glyph('arrow')} {_shorten(host, LOGO_WIDTH - 14)}[/{MUTED}]"
+            )
+        )
+    return lines
+
+
+def _guide_block(mounts: list[tuple[str, str]], local: bool) -> list[Text]:
+    """Right column: how to start, and what is already here."""
+    lines = [Text.from_markup(f"[{TOOL}]Tips for getting started[/{TOOL}]")]
+    for tip in TIPS:
+        lines.append(Text.from_markup(f"[{DETAIL}]{tip}[/{DETAIL}]"))
+
+    lines.append(Text(""))
+    lines.append(Text.from_markup(f"[{TOOL}]Recent activity[/{TOOL}]"))
+    recent = recent_activity(mounts)
+    if recent:
+        for entry in recent:
+            lines.append(Text(entry, style=MUTED))
+    else:
+        lines.append(Text("No recent activity", style=MUTED))
+    return lines
+
+
+# Panel borders (2) plus its horizontal padding (2 each side).
+_PANEL_CHROME = 6
+# Grid padding either side of the divider, plus the divider itself.
+_COLUMN_GAP = 5
+
+
+def _guide_width(console_width: int) -> int:
+    return console_width - _PANEL_CHROME - LOGO_WIDTH - _COLUMN_GAP
+
+
+def _side_by_side(left: list[Text], right: list[Text], console_width: int) -> Table:
+    """Align two ragged columns with a rule between them.
+
+    Every column is given an explicit width. Left to itself, rich shrinks the
+    fixed wordmark column to make room for the flexible one, which truncates
+    the logo mid-glyph.
+    """
+    height = max(len(left), len(right))
+    left = left + [Text("")] * (height - len(left))
+    right = right + [Text("")] * (height - len(right))
+
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(width=LOGO_WIDTH, no_wrap=True, overflow="crop")
+    grid.add_column(width=1, no_wrap=True)
+    grid.add_column(width=_guide_width(console_width), overflow="ellipsis", no_wrap=True)
+    divider = Text(glyph("bar"), style=BORDER)
+    for i in range(height):
+        grid.add_row(left[i], divider, right[i])
+    return grid
+
+
+def make_approver(console: Console, renderer: Renderer | None = None):
+    """Build the approval prompt for host mode.
+
+    Lives here rather than in permissions.py so the gate stays free of any
+    rendering, the same way the loop is.
+    """
+    from .permissions import Decision, Request, Risk
+
+    risk_style = {
+        Risk.READ_ONLY: DETAIL,
+        Risk.MODIFIES: WARN,
+        Risk.DANGEROUS: FAIL,
+    }
+
+    def ask(request: Request) -> Decision:
+        if renderer is not None:
+            renderer.close()  # stop the spinner before taking over the line
+
+        verb = {"run": "run", "write": "write to", "read": "read"}[request.action]
+        style = risk_style[request.risk]
+        console.print()
+        console.print(
+            f"[{style}] permission [/{style}] [{TOOL}]{verb}[/{TOOL}] "
+            f"[{DETAIL}]{request.detail}[/{DETAIL}]"
+        )
+        if request.outside_root:
+            console.print(
+                f"  [{FAIL}] outside {request.root} [/{FAIL}]",
+            )
+        if request.risk is Risk.DANGEROUS:
+            console.print(f"  [{WARN}]this is a destructive operation[/{WARN}]")
+
+        key = request.remember_key.split(":", 1)[1]
+        console.print(
+            f"  [{MUTED}][[/{MUTED}][{OK}]y[/{OK}][{MUTED}]] yes  "
+            f"[[/{MUTED}][{TOOL}]a[/{TOOL}][{MUTED}]] always allow "
+            f"{key}  [[/{MUTED}][{WARN}]n[/{WARN}][{MUTED}]] no[/{MUTED}]"
+        )
+
+        try:
+            answer = input("  > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            console.print(f"  [{WARN}]denied[/{WARN}]")
+            return Decision.NO
+
+        if answer in ("a", "always"):
+            return Decision.ALWAYS
+        if answer in ("y", "yes"):
+            return Decision.ONCE
+        return Decision.NO
+
+    return ask
 
 
 def input_rule(console: Console) -> None:
-    """The top edge of the input area, drawn just above the prompt.
+    """The rule above the prompt. prompt_toolkit's bottom toolbar closes the
+    frame underneath, giving the input a top and bottom edge.
 
-    Only the top edge on purpose: a full box would need a full-screen
+    Rules rather than a real box: a four-sided box needs a full-screen
     prompt_toolkit application, which takes over the terminal and destroys
-    scrollback. Not worth losing scrollback for a border.
+    scrollback. Not worth losing scrollback for two vertical lines.
     """
-    corner, line = ("+", "-") if ascii_only() else ("╭", "─")
-    console.print(f"[{BORDER}]{corner}{line * max(4, console.width - 2)}[/{BORDER}]")
+    line = "-" if ascii_only() else "─"
+    console.print(f"[{BORDER}]{line * max(4, console.width - 1)}[/{BORDER}]")
 
 
 def turn_footer(console: Console, result: Any, elapsed: float) -> None:

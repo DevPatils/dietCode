@@ -12,12 +12,24 @@ of record; [README.md](README.md) is where benchmark results go.
 ## Commands
 
 ```bash
-python -m pytest                          # full suite; Docker tests skip if the daemon is down
+pip install -e ".[dev]"                    # editable install; provides the `dietcode` command
+python -m pytest                           # full suite; Docker tests skip if the daemon is down
 python -m pytest tests/test_loop.py        # one file
 python -m pytest -k "timeout"              # one test by name
-python cli.py "task description"           # run the agent (needs GROQ_API_KEY + Docker)
-python cli.py --local --workdir /tmp/x "…"  # host execution, no isolation, dev only
+dietcode "task description"                # the installed command
+python cli.py "task description"           # same code, from a checkout
 ```
+
+**`cli.py` at the repo root is a two-line shim.** The real entrypoint is
+[agent/cli.py](agent/cli.py), so the installed `dietcode` command and the checkout path
+execute identical code. Console script is `dietcode = "agent.cli:entrypoint"`.
+
+**Credentials never live in the project.** [agent/auth.py](agent/auth.py) stores keys in
+the OS keychain, falling back to `~/.dietcode/credentials.json` at 0600. Resolution
+order is env var, then saved login — the env var wins so CI can override without
+touching a user's login. Keys are cleaned of BOMs and zero-width characters on the way
+in: `str.strip()` leaves them, and PowerShell adds a BOM when piping, which silently
+corrupts the stored key and surfaces later as an unexplained 401.
 
 **Two interpreters.** The agent runs on Python 3.11 (the default `python` here).
 terminal-bench requires ≥3.12 and is installed on 3.13. So:

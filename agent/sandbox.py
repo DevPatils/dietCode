@@ -372,7 +372,7 @@ class DockerExecutor:
         except (SandboxError, subprocess.SubprocessError, OSError):
             pass
 
-    def __enter__(self) -> "DockerExecutor":
+    def __enter__(self) -> DockerExecutor:
         return self
 
     def __exit__(self, *exc_info: object) -> None:

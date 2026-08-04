@@ -235,14 +235,78 @@ def test_logo_falls_back_to_ascii(monkeypatch):
     plain.encode("cp1252")  # the block-drawing logo would raise here
 
 
-def test_banner_fits_one_line_per_fact(console):
+LONG_PATH = "C:/Users/Someone/OneDrive/Desktop/Projects/dietCode/agent-work"
+
+
+@pytest.mark.parametrize("width", [70, 78, 100, 110, 140, 200])
+def test_banner_never_overflows_its_width(width):
+    """A wrapped or over-wide banner reads as a rendering bug."""
     from agent.ui import banner
 
-    long_path = "C:/Users/Someone/OneDrive/Desktop/Projects/dietCode/agent-work"
-    banner(console, "llama-3.3-70b", "cli-agent-abc123", [(long_path, "/workspace")], local=False)
-    using = [ln for ln in output(console).splitlines() if ln.startswith("Using:")]
-    assert len(using) == 1
-    assert len(using[0]) <= console.width
+    console = Console(file=io.StringIO(), width=width, no_color=True)
+    banner(console, "llama-3.3-70b", "cli-agent-abc123", [(LONG_PATH, "/workspace")], local=False)
+    for line in console.file.getvalue().splitlines():
+        assert len(line) <= width, f"line overflows at width {width}: {line!r}"
+
+
+def test_wide_terminals_get_two_columns():
+    from agent.ui import banner
+
+    console = Console(file=io.StringIO(), width=120, no_color=True)
+    banner(console, "llama-3.3-70b", "c", [(LONG_PATH, "/workspace")], local=False)
+    rendered = console.file.getvalue()
+    logo_row = next(ln for ln in rendered.splitlines() if "Tips for getting started" in ln)
+    # Tips sit beside the wordmark, not under it.
+    assert "█" in logo_row or "_" in logo_row
+
+
+def test_narrow_terminals_stack_instead_of_squeezing():
+    from agent.ui import banner
+
+    console = Console(file=io.StringIO(), width=76, no_color=True)
+    banner(console, "llama-3.3-70b", "c", [], local=False)
+    logo_row = next(ln for ln in console.file.getvalue().splitlines() if "Tips" in ln)
+    assert "█" not in logo_row
+
+
+def test_the_wordmark_is_never_truncated():
+    """rich shrinks a fixed column to fit a flexible neighbour, which cuts the
+    logo mid-glyph."""
+    from agent.ui import LOGO_WIDTH, banner, logo_lines
+
+    console = Console(file=io.StringIO(), width=120, no_color=True)
+    banner(console, "m", "c", [], local=False)
+    rendered = console.file.getvalue()
+    widest = max(logo_lines(), key=lambda t: len(t.plain)).plain.strip()
+    assert widest in rendered
+    assert LOGO_WIDTH >= len(widest)
+
+
+def test_recent_activity_lists_newest_first(tmp_path):
+    import os
+    import time
+
+    from agent.ui import recent_activity
+
+    for i, name in enumerate(["old.txt", "mid.txt", "new.txt"]):
+        p = tmp_path / name
+        p.write_text("x" * (i + 1))
+        os.utime(p, (time.time() + i, time.time() + i))
+
+    entries = recent_activity([(str(tmp_path), "/workspace")])
+    assert entries[0].startswith("new.txt")
+
+
+def test_recent_activity_is_empty_without_a_mount():
+    from agent.ui import recent_activity
+
+    assert recent_activity([]) == []
+
+
+def test_recent_activity_survives_a_missing_directory():
+    from agent.ui import recent_activity
+
+    assert recent_activity([("/definitely/not/here", "/workspace")]) == []
 
 
 def test_context_percent():
@@ -298,6 +362,68 @@ def session(tmp_path, monkeypatch):
 def test_exit_command_ends_the_session(session):
     assert session.handle_command("/exit") is False
     assert session.handle_command("/quit") is False
+
+
+def test_every_advertised_command_is_dispatchable(session, monkeypatch):
+    """A command listed in /help that does nothing is worse than not listing it."""
+    from agent.repl import COMMANDS
+
+    for name in COMMANDS:
+        if name in ("/exit",):
+            continue
+        # Stub the ones that would prompt or shell out.
+        monkeypatch.setattr("agent.repl.login", lambda *a, **k: 0)
+        monkeypatch.setattr("agent.repl.logout", lambda *a, **k: 0)
+        monkeypatch.setattr("agent.repl.auth_status", lambda *a, **k: 0)
+        monkeypatch.setattr("agent.repl.doctor", lambda *a, **k: 0)
+        assert session.handle_command(name) is True, name
+        assert "unknown command" not in output(session.console), name
+
+
+def test_model_can_be_switched_mid_session(session):
+    session.handle_command("/model llama-3.1-8b-instant")
+    assert session.model == "llama-3.1-8b-instant"
+
+
+def test_model_with_no_argument_reports_the_current_one(session):
+    session.model = "some-model"
+    session.handle_command("/model")
+    assert "some-model" in output(session.console)
+
+
+def test_switching_provider_without_a_key_is_refused(session, monkeypatch):
+    """Leaving the session pointed at a provider it cannot authenticate with
+    would fail every later turn."""
+    monkeypatch.setattr("agent.repl.resolve_key", lambda name: (None, "not set"))
+    before_provider, before_model = session.provider, session.model
+    session.handle_command("/provider gemini")
+    assert session.provider == before_provider
+    assert session.model == before_model
+    assert "no key" in output(session.console)
+
+
+def test_switching_provider_updates_model_and_client(session, monkeypatch):
+    monkeypatch.setattr("agent.repl.resolve_key", lambda name: ("k", "saved login"))
+    monkeypatch.setattr("agent.repl.make_client", lambda **kw: "new-client")
+    session.handle_command("/provider gemini")
+    assert session.provider == "gemini"
+    assert session.model == "gemini-2.5-flash"
+    assert session.client == "new-client"
+
+
+def test_switching_provider_keeps_the_conversation(session, monkeypatch):
+    """Changing model mid-task is the point; the transcript is not provider
+    specific."""
+    monkeypatch.setattr("agent.repl.resolve_key", lambda name: ("k", "saved login"))
+    monkeypatch.setattr("agent.repl.make_client", lambda **kw: "new-client")
+    session.history = [{"role": "user", "content": "earlier"}]
+    session.handle_command("/provider gemini")
+    assert session.history == [{"role": "user", "content": "earlier"}]
+
+
+def test_unknown_provider_is_reported(session):
+    session.handle_command("/provider hotdog")
+    assert "unknown provider" in output(session.console)
 
 
 def test_help_lists_commands(session):

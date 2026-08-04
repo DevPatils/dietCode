@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from agent.auth import AuthError, default_provider, get_provider, resolve_key
 from agent.loop import DEFAULT_MAX_ITERATIONS, DEFAULT_MODEL, agent_loop, make_client
 from agent.sandbox import DockerExecutor, SandboxError
 
@@ -46,6 +47,19 @@ except ImportError as exc:  # pragma: no cover - exercised only without the harn
         "terminal-bench is not installed in this interpreter. "
         "Install it with `pip install terminal-bench` (requires Python >= 3.12)."
     ) from exc
+
+
+def _credentials() -> tuple[str, str]:
+    """(api_key, base_url) for whichever provider is configured."""
+    provider = default_provider()
+    spec = get_provider(provider)
+    api_key, _source = resolve_key(provider)
+    if not api_key:
+        raise AuthError(
+            f"no API key for {spec.label}. Run `dietcode login {spec.name}` "
+            f"or set ${spec.env_var}."
+        )
+    return api_key, spec.base_url
 
 
 class SessionExecutor(DockerExecutor):
@@ -141,8 +155,12 @@ class CliAgent(BaseAgent):
         executor = SessionExecutor(session, workdir=self._workdir)
 
         try:
-            client = make_client()
-        except RuntimeError as exc:
+            # Resolve through the same credential path the CLI uses, so a
+            # `dietcode login` is enough to run the benchmark -- tb does not
+            # load .env and exporting a key per shell is easy to forget.
+            api_key, base_url = _credentials()
+            client = make_client(api_key=api_key, base_url=base_url)
+        except (AuthError, RuntimeError) as exc:
             # Almost always a missing GROQ_API_KEY. Surface it -- otherwise every
             # task in the run fails identically with no visible reason.
             if logging_dir is not None:

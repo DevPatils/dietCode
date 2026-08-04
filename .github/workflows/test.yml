@@ -1,0 +1,45 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both OSes on purpose: the cp1252 console bug and the Windows
+        # drive-letter mount parsing are only reachable on Windows, and the
+        # Docker tests only run on the Linux runners.
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check agent adapters tests
+
+      - name: Test
+        # Docker tests skip themselves when no daemon is reachable, so this is
+        # the same command everywhere. Ubuntu runners have one; Windows does not.
+        run: python -m pytest -q
+
+      - name: Terminal-Bench adapter
+        # Needs Python >= 3.12, so it only runs on the newer matrix entry.
+        if: matrix.python == '3.13'
+        run: |
+          pip install terminal-bench
+          python -m pytest tests/test_adapter.py -q
