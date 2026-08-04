@@ -35,8 +35,13 @@ jobs:
       - name: Build
         run: |
           python -m pip install --upgrade pip build twine
+          # Start from an empty dist/. A previously committed artifact would
+          # otherwise be uploaded next to the new one, and PyPI rejects the
+          # whole upload because that version already exists.
+          rm -rf dist
           python -m build
           python -m twine check dist/*
+          ls -l dist/
 
       - uses: actions/upload-artifact@v4
         with:
