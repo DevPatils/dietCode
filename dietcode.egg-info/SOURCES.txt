@@ -12,6 +12,7 @@ agent/loop.py
 agent/permissions.py
 agent/repl.py
 agent/sandbox.py
+agent/subagent.py
 agent/tools.py
 agent/ui.py
 dietcode.egg-info/PKG-INFO
@@ -22,11 +23,13 @@ dietcode.egg-info/requires.txt
 dietcode.egg-info/top_level.txt
 tests/test_adapter.py
 tests/test_auth.py
+tests/test_editing.py
 tests/test_integration.py
 tests/test_limits.py
 tests/test_loop.py
 tests/test_permissions.py
 tests/test_sandbox.py
 tests/test_streaming.py
+tests/test_subagent.py
 tests/test_tools.py
 tests/test_ui.py
