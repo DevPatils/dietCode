@@ -123,9 +123,12 @@ class Session:
         context_budget: int = DEFAULT_CONTEXT_BUDGET,
         max_total_tokens: int | None = None,
         provider: str | None = None,
+        extras: dict[str, Any] | None = None,
     ):
         self.context_budget = context_budget
         self.max_total_tokens = max_total_tokens
+        # Project instructions and sub-agent wiring, built once by the CLI.
+        self.extras = extras or {}
         # Tracked so /login and /provider can rebuild the client in place.
         self.provider = provider or default_provider()
         self.executor = executor
@@ -352,6 +355,7 @@ class Session:
                 max_total_tokens=self.max_total_tokens,
                 history=self.history,
                 on_event=self.renderer.on_event,
+                **self.extras,
             )
         except KeyboardInterrupt:
             # The turn is discarded rather than half-kept: a transcript with

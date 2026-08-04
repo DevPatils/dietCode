@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 DEFAULT_TIMEOUT = 30
@@ -115,10 +116,26 @@ class ShellResult:
     timed_out: bool = False
 
 
+# Never worth walking: huge, generated, and never what is being looked for.
+SKIP_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "target", ".next",
+}
+MAX_MATCHES = 200
+
+
 class Executor(Protocol):
     def run_shell(self, command: str, timeout: int = DEFAULT_TIMEOUT) -> ShellResult: ...
     def read_file(self, path: str) -> str: ...
     def write_file(self, path: str, content: str) -> None: ...
+    # Listing and searching live on the executor rather than in tools.py because
+    # the two backends do them completely differently: the container has find
+    # and grep, the host may be Windows and have neither.
+    def list_files(self, root: str = ".", limit: int = MAX_MATCHES * 4) -> list[str]: ...
+    def search(
+        self, pattern: str, root: str = ".", glob: str | None = None,
+        limit: int = MAX_MATCHES,
+    ) -> list[str]: ...
     def close(self) -> None: ...
 
 
@@ -182,6 +199,50 @@ class LocalExecutor:
             target.write_text(content, encoding="utf-8")
         except OSError as exc:
             raise SandboxError(f"could not write {path}: {exc}") from None
+
+    def list_files(self, root: str = ".", limit: int = MAX_MATCHES * 4) -> list[str]:
+        """Walk in Python, not the shell: the host may be Windows, which has
+        neither find nor a compatible grep."""
+        base = self._resolve(root)
+        if not base.is_dir():
+            raise SandboxError(f"no such directory: {root}")
+
+        found: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for filename in sorted(filenames):
+                rel = Path(dirpath, filename).relative_to(base)
+                found.append(rel.as_posix())
+                if len(found) >= limit:
+                    return found
+        return found
+
+    def search(
+        self,
+        pattern: str,
+        root: str = ".",
+        glob: str | None = None,
+        limit: int = MAX_MATCHES,
+    ) -> list[str]:
+        regex = re.compile(pattern)
+        base = self._resolve(root)
+        if not base.is_dir():
+            raise SandboxError(f"no such directory: {root}")
+
+        hits: list[str] = []
+        for rel in self.list_files(root, limit=MAX_MATCHES * 20):
+            if glob and not PurePosixPath(rel).match(glob):
+                continue
+            try:
+                text = (base / rel).read_text(encoding="utf-8", errors="strict")
+            except (OSError, UnicodeDecodeError):
+                continue  # binary or unreadable; grep -I skips these too
+            for number, line in enumerate(text.splitlines(), 1):
+                if regex.search(line):
+                    hits.append(f"{rel}:{number}:{line.strip()[:200]}")
+                    if len(hits) >= limit:
+                        return hits
+        return hits
 
     def close(self) -> None:
         pass
@@ -422,6 +483,39 @@ class DockerExecutor:
                 f"could not read {path}: {stderr.strip() or 'no such file'}"
             )
         return stdout
+
+    def list_files(self, root: str = ".", limit: int = MAX_MATCHES * 4) -> list[str]:
+        """find(1) inside the container, with the generated directories pruned."""
+        prune = " -o ".join(f"-name {shlex.quote(d)}" for d in sorted(SKIP_DIRS))
+        result = self.run_shell(
+            f"cd {shlex.quote(root)} 2>/dev/null || exit 9; "
+            f"find . \\( {prune} \\) -prune -o -type f -print 2>/dev/null "
+            f"| sed 's|^\\./||' | sort | head -n {limit}",
+            timeout=60,
+        )
+        if result.exit_code == 9:
+            raise SandboxError(f"no such directory: {root}")
+        return [line for line in result.stdout.splitlines() if line.strip()]
+
+    def search(
+        self,
+        pattern: str,
+        root: str = ".",
+        glob: str | None = None,
+        limit: int = MAX_MATCHES,
+    ) -> list[str]:
+        excludes = " ".join(f"--exclude-dir={shlex.quote(d)}" for d in sorted(SKIP_DIRS))
+        include = f"--include={shlex.quote(glob)}" if glob else ""
+        result = self.run_shell(
+            f"cd {shlex.quote(root)} 2>/dev/null || exit 9; "
+            # -I skips binaries, -E for the same regex flavour Python compiled.
+            f"grep -rnI -E {shlex.quote(pattern)} . {excludes} {include} 2>/dev/null "
+            f"| sed 's|^\\./||' | head -n {limit}",
+            timeout=90,
+        )
+        if result.exit_code == 9:
+            raise SandboxError(f"no such directory: {root}")
+        return [line for line in result.stdout.splitlines() if line.strip()]
 
     def write_file(self, path: str, content: str) -> None:
         encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")

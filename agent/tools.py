@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import PurePosixPath
 from typing import Any
 
-from .sandbox import DEFAULT_TIMEOUT, Executor, SandboxError
+from .sandbox import DEFAULT_TIMEOUT, MAX_MATCHES, Executor, SandboxError
 
 # Cap on a single tool result. Shell commands like `find /` can emit megabytes,
 # which would blow the context window and the free-tier token budget in one turn.
@@ -49,6 +50,74 @@ TOOLS: list[dict[str, Any]] = [
                     "content": {"type": "string", "description": "Full file contents."},
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Replace an exact snippet in a file. Prefer this over write_file "
+                "for changes to existing files: it costs a fraction of the tokens "
+                "and cannot accidentally drop the parts you did not mention. "
+                "`old` must appear exactly once, including indentation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file."},
+                    "old": {
+                        "type": "string",
+                        "description": "Exact text to replace, including indentation.",
+                    },
+                    "new": {"type": "string", "description": "Text to put in its place."},
+                    "replace_all": {
+                        "type": ["boolean", "string"],
+                        "description": "Replace every occurrence instead of requiring exactly one.",
+                    },
+                },
+                "required": ["path", "old", "new"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": (
+                "List files matching a glob, e.g. '**/*.py' or 'src/*.ts'. "
+                "Faster and more reliable than shelling out to find."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern."},
+                    "path": {"type": "string", "description": "Directory to search from."},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search",
+            "description": (
+                "Search file contents for a regular expression and return matching "
+                "lines with their file and line number."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regular expression."},
+                    "path": {"type": "string", "description": "Directory to search from."},
+                    "glob": {
+                        "type": "string",
+                        "description": "Only search files matching this glob, e.g. '*.py'.",
+                    },
+                },
+                "required": ["pattern"],
             },
         },
     },
@@ -272,6 +341,93 @@ def format_shell_result(result: Any) -> str:
     return "\n".join(parts)
 
 
+def _coerce_bool(value: Any) -> bool:
+    """Models send true, "true", "True" and 1 interchangeably."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1")
+    return bool(value)
+
+
+def _edit_file(
+    executor: Executor, path: str, old: str, new: str, replace_all: Any
+) -> str:
+    """Replace an exact snippet, or explain precisely why it could not.
+
+    A silent near-miss is the dangerous failure here: if `old` does not match,
+    the only safe move is to refuse and say so, because guessing at what the
+    model meant would corrupt the file. The error text is written for the model
+    to act on, since it is what comes back as the tool result.
+    """
+    if not old:
+        return (
+            "Error: 'old' was empty. To create a file or replace it entirely, "
+            "use write_file."
+        )
+
+    content = executor.read_file(path)
+    count = content.count(old)
+
+    if count == 0:
+        # Whitespace is the usual culprit, so say so rather than just "no match".
+        hint = ""
+        if old.strip() and old.strip() in content:
+            hint = (
+                " The text is present but the surrounding whitespace differs — "
+                "read the file again and copy the indentation exactly."
+            )
+        return f"Error: 'old' text was not found in {path}.{hint}"
+
+    if count > 1 and not _coerce_bool(replace_all):
+        return (
+            f"Error: 'old' text appears {count} times in {path}. Include more "
+            f"surrounding context to make it unique, or pass replace_all: true."
+        )
+
+    updated = content.replace(old, new)
+    executor.write_file(path, updated)
+
+    delta = updated.count("\n") - content.count("\n")
+    sign = "+" if delta > 0 else ""
+    where = f"{count} occurrences" if count > 1 else "1 occurrence"
+    return f"Edited {path} ({where}, {sign}{delta} lines)"
+
+
+def _find_files(executor: Executor, pattern: str, root: str) -> str:
+    """Glob matching applied in Python: shell globstar support varies, and
+    PurePosixPath.match handles '**' the same way everywhere."""
+    paths = executor.list_files(root)
+    matches = [p for p in paths if PurePosixPath(p).match(pattern)]
+    if not matches:
+        return f"No files matching {pattern!r} under {root}"
+
+    shown = matches[:MAX_MATCHES]
+    out = "\n".join(shown)
+    if len(matches) > len(shown):
+        out += f"\n… {len(matches) - len(shown)} more matches"
+    return out
+
+
+def _search(executor: Executor, pattern: str, root: str, glob: Any) -> str:
+    # Compile here so a bad pattern is a clear message rather than an empty
+    # result from a grep that silently failed.
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        return f"Error: invalid regular expression: {exc}"
+
+    hits = executor.search(
+        pattern, root, glob if isinstance(glob, str) and glob else None
+    )
+    if not hits:
+        return f"No matches for {pattern!r} under {root}"
+    out = "\n".join(hits[:MAX_MATCHES])
+    if len(hits) > MAX_MATCHES:
+        out += f"\n… {len(hits) - MAX_MATCHES} more matches"
+    return out
+
+
 def execute_tool(name: Any, arguments: Any, executor: Executor) -> str:
     """Dispatch one tool call. Returns the tool result as a string, always.
 
@@ -309,6 +465,32 @@ def execute_tool(name: Any, arguments: Any, executor: Executor) -> str:
             executor.write_file(path, content)
             line_count = content.count("\n") + (1 if content else 0)
             return f"Wrote {len(content)} bytes ({line_count} lines) to {path}"
+
+        if name == "edit_file":
+            path, err = _require_str(args, "path")
+            if err:
+                return f"Error: {err}"
+            old, err = _require_str(args, "old")
+            if err:
+                return f"Error: {err}"
+            new, err = _require_str(args, "new")
+            if err:
+                return f"Error: {err}"
+            return _edit_file(executor, path, old, new, args.get("replace_all"))
+
+        if name == "find_files":
+            pattern, err = _require_str(args, "pattern")
+            if err:
+                return f"Error: {err}"
+            root = args.get("path") or "."
+            return _find_files(executor, pattern, str(root))
+
+        if name == "search":
+            pattern, err = _require_str(args, "pattern")
+            if err:
+                return f"Error: {err}"
+            root = args.get("path") or "."
+            return _search(executor, pattern, str(root), args.get("glob"))
 
         if name == "run_shell":
             command, err = _require_str(args, "command")

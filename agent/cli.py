@@ -28,8 +28,11 @@ from .commands import auth_status, doctor, login, logout
 from .loop import (
     DEFAULT_CONTEXT_BUDGET,
     DEFAULT_MAX_ITERATIONS,
+    SYSTEM_PROMPT,
     agent_loop,
+    load_project_context,
     make_client,
+    with_project_context,
 )
 from .permissions import PermissionGate, Policy, deny_all
 from .repl import Session
@@ -42,6 +45,8 @@ from .sandbox import (
     LocalExecutor,
     SandboxError,
 )
+from .subagent import SPAWN_TOOL, make_spawn_handler
+from .tools import TOOLS
 from .ui import FAIL, Renderer, make_approver, turn_footer, use_utf8_stdout
 
 SUBCOMMANDS = {"login", "logout", "auth", "doctor"}
@@ -65,6 +70,17 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument("--model", help="override the provider's default model")
     model.add_argument("--base-url", help="use an OpenAI-compatible endpoint directly")
     model.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
+    model.add_argument(
+        "--subagents",
+        action="store_true",
+        help="let the agent delegate self-contained work to sub-agents",
+    )
+    model.add_argument(
+        "--no-context",
+        dest="context",
+        action="store_false",
+        help="ignore DIETCODE.md / AGENTS.md / CLAUDE.md in the working directory",
+    )
     model.add_argument(
         "--max-tokens",
         type=int,
@@ -211,6 +227,28 @@ def make_executor(args: argparse.Namespace, console: Console) -> tuple[Any, list
     return executor, mounts
 
 
+def build_agent_extras(
+    args: argparse.Namespace, executor: Any, client: Any, model: str, console: Console
+) -> dict[str, Any]:
+    """The optional bits: project instructions and sub-agent delegation."""
+    extras: dict[str, Any] = {}
+
+    if getattr(args, "context", True):
+        context, source = load_project_context(args.workdir if args.here else ".")
+        if source:
+            extras["system_prompt"] = with_project_context(SYSTEM_PROMPT, context, source)
+            console.print(f"[dim]using project instructions from {source}[/dim]")
+
+    if getattr(args, "subagents", False):
+        extras["tools"] = [*TOOLS, SPAWN_TOOL]
+        extras["extra_tool_handlers"] = {
+            "spawn_subagent": make_spawn_handler(
+                executor, client, model, context_budget=args.context_budget
+            )
+        }
+    return extras
+
+
 def run_once(args: argparse.Namespace, executor: Any, client: Any, model: str) -> int:
     console = Console(quiet=args.quiet and not args.json)
     renderer = Renderer(console, show_steps=args.steps)
@@ -226,6 +264,7 @@ def run_once(args: argparse.Namespace, executor: Any, client: Any, model: str) -
             context_budget=args.context_budget,
             max_total_tokens=args.max_tokens,
             on_event=None if args.quiet else renderer.on_event,
+            **build_agent_extras(args, executor, client, model, console),
         )
     except KeyboardInterrupt:
         renderer.close()
@@ -344,6 +383,7 @@ def main(argv: list[str] | None = None) -> int:
             context_budget=args.context_budget,
             max_total_tokens=args.max_tokens,
             provider=args.provider or default_provider(),
+            extras=build_agent_extras(args, executor, client, model, console),
         ).run()
     finally:
         executor.close()

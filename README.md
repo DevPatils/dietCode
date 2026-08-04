@@ -125,6 +125,8 @@ python cli.py --mount ./my-project "add a test for the parser and make it pass"
 | --- | --- |
 | `--steps` | show step separators |
 | `--no-stream` | wait for each reply instead of showing it as it is generated |
+| `--subagents` | let the agent delegate self-contained work to sub-agents |
+| `--no-context` | ignore the project's `DIETCODE.md` / `AGENTS.md` |
 | `--provider groq\|gemini\|openai` | which API to use (default: your saved login) |
 | `--base-url URL` | any OpenAI-compatible endpoint (Ollama, vLLM, OpenRouter) |
 | `--no-network` | cut the sandbox off from the network entirely |
@@ -176,8 +178,24 @@ either way.
 
 `agent_loop` calls the model, executes whatever tools it asks for, feeds the
 results back, and repeats until `task_complete`, a turn with no tool calls, or
-`max_iterations`. Four tools: `read_file`, `write_file`, `run_shell`,
-`task_complete`.
+`max_iterations`.
+
+**Tools:** `read_file`, `write_file`, `edit_file`, `find_files`, `search`,
+`run_shell`, `task_complete` — plus `spawn_subagent` behind `--subagents`.
+
+`edit_file` replaces an exact snippet rather than rewriting the file, so a
+one-line change costs one line instead of four hundred. It refuses rather than
+guesses: no match, or an ambiguous match, is an error explaining what to fix.
+
+`--subagents` lets the agent delegate self-contained work to a fresh agent that
+shares the files but not the conversation, and reports back only a summary.
+The context isolation is the point — passing the transcript back would cost as
+much as doing the work inline.
+
+**Project instructions.** If the working directory has a `DIETCODE.md`,
+`AGENTS.md`, `CLAUDE.md` or `.cursorrules`, it is appended to the system prompt
+and takes precedence over the defaults. Read from the host, so the agent can't
+rewrite its own standing orders. `--no-context` skips it.
 
 The only thing that differs between the CLI and the benchmark is which `Executor`
 gets passed in, so both run identical tool code.

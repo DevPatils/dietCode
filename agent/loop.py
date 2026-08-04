@@ -52,8 +52,14 @@ Rules:
 text in your reply (no <function=...> tags, no JSON describing a call) -- text \
 is not executed.
 - Work in small steps. Inspect the environment before changing it.
-- Prefer run_shell for exploration (ls, cat, grep, find) and for running tests.
-- write_file overwrites the whole file, so always pass the complete final contents.
+- Use find_files to locate files and search to find code. They are cheaper and \
+more reliable than shelling out to find or grep.
+- To change an existing file use edit_file, which replaces an exact snippet. \
+Only use write_file to create a new file or replace one outright: it rewrites \
+everything, which is expensive and easy to get wrong.
+- edit_file needs `old` to match the file exactly, whitespace included. If it \
+reports no match, read the file again rather than guessing.
+- Use run_shell to run commands and tests.
 - Verify your work before finishing: re-read files you wrote, run the tests, check \
 exit codes.
 - When the task is genuinely done and verified, call task_complete with a summary \
@@ -62,6 +68,52 @@ of what you did. Do not call it before that.
 repeat an identical failing call.
 
 You are graded on the final state of the container, not on your explanation."""
+
+# Files a project can leave for the agent, in the order they are looked for.
+# AGENTS.md is the emerging cross-tool convention; the others are what people
+# already have lying around.
+CONTEXT_FILES = ("DIETCODE.md", "AGENTS.md", "CLAUDE.md", ".cursorrules")
+MAX_CONTEXT_CHARS = 8000
+
+
+def load_project_context(root: str | os.PathLike[str] = ".") -> tuple[str, str | None]:
+    """Read a project's instructions file, if it has one.
+
+    Returns (text, filename). Read from the host rather than through the
+    Executor on purpose: this is the *user's* standing instructions, and it
+    should not be something the agent can rewrite mid-run to change its own
+    rules.
+    """
+    from pathlib import Path
+
+    base = Path(root)
+    for name in CONTEXT_FILES:
+        candidate = base / name
+        try:
+            if not candidate.is_file():
+                continue
+            text = candidate.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if not text:
+            continue
+        if len(text) > MAX_CONTEXT_CHARS:
+            text = text[:MAX_CONTEXT_CHARS] + "\n… [truncated]"
+        return text, name
+    return "", None
+
+
+def with_project_context(system_prompt: str, context: str, source: str | None) -> str:
+    """Append the project's own instructions, marked as outranking the defaults."""
+    if not context:
+        return system_prompt
+    return (
+        f"{system_prompt}\n\n"
+        f"--- Project instructions from {source} ---\n"
+        f"These come from the person you are working for. Where they conflict "
+        f"with anything above, follow these.\n\n"
+        f"{context}"
+    )
 
 
 @dataclass

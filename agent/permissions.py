@@ -257,6 +257,30 @@ class PermissionGate:
             raise SandboxError(f"reading {path} was denied by the user")
         return self._inner.read_file(path)
 
+    def list_files(self, root: str = ".", limit: int = 800) -> list[str]:
+        # Listing and searching are reads; they follow the same rule as
+        # read_file rather than getting their own prompt.
+        if self._outside_root(root):
+            request = Request(
+                action="read", detail=str(self._resolve(root)), risk=Risk.READ_ONLY,
+                outside_root=True, root=str(self.root),
+            )
+            if not self._permitted(request):
+                raise SandboxError(f"listing {root} was denied by the user")
+        return self._inner.list_files(root, limit)
+
+    def search(
+        self, pattern: str, root: str = ".", glob: str | None = None, limit: int = 200
+    ) -> list[str]:
+        if self._outside_root(root):
+            request = Request(
+                action="read", detail=str(self._resolve(root)), risk=Risk.READ_ONLY,
+                outside_root=True, root=str(self.root),
+            )
+            if not self._permitted(request):
+                raise SandboxError(f"searching {root} was denied by the user")
+        return self._inner.search(pattern, root, glob, limit)
+
     def write_file(self, path: str, content: str) -> None:
         outside = self._outside_root(path)
         request = Request(

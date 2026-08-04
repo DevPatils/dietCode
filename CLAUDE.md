@@ -99,8 +99,28 @@ so the benchmark exercises the same code the CLI does. Adding a second implement
 any tool behaviour in the adapter defeats the entire design.
 
 `agent_loop` returns an `AgentResult` with status `complete` | `stopped` |
-`max_iterations_reached` | `error`, plus steps, tool-call counts and token usage —
-`.metrics()` is what feeds the README table.
+`max_iterations_reached` | `budget_exhausted` | `error`, plus steps, tool-call counts
+and token usage — `.metrics()` is what feeds the README table.
+
+**Seven tools.** `read_file`, `write_file`, `edit_file`, `find_files`, `search`,
+`run_shell`, `task_complete`. `spawn_subagent` is an eighth, opt-in via `--subagents`.
+
+- **`edit_file` never guesses.** A snippet matches exactly once or the call fails with
+  a reason the model can act on — including a specific "the text is there but the
+  whitespace differs" hint, which is the usual cause. Editing the wrong place silently
+  is worse than not editing.
+- **`find_files` / `search` live on the `Executor`, not in tools.py.** The two backends
+  do them completely differently: the container has `find` and `grep`, the host may be
+  Windows and have neither. A shell-based implementation in tools.py broke `--here` on
+  Windows — that is why the capability moved down a layer.
+- **`spawn_subagent` returns only the child's summary.** The isolation is the mechanism
+  being tested; passing the transcript back would grow the parent's context exactly as
+  fast as doing the work inline. Depth is capped at 1 — a child that can spawn children
+  recurses until the daily request quota is gone.
+
+**Project instructions** (`DIETCODE.md`, `AGENTS.md`, `CLAUDE.md`, `.cursorrules`) are
+read from the *host*, never through the `Executor`, so the agent cannot rewrite its own
+standing orders mid-run.
 
 ## Invariants
 
