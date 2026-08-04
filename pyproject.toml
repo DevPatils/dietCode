@@ -4,8 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dietcode"
-version = "0.1.0"
-description = "A CLI coding agent that writes and runs code in a Docker sandbox."
+# Read from agent/__init__.py, never written here. A hardcoded version drifts
+# from the source, and the release then builds one number while the tag check
+# passes on another -- PyPI rejects the upload and the failure looks unrelated.
+dynamic = ["version"]
+description = "A CLI coding agent that writes and runs code in a sandbox."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -50,6 +53,9 @@ dietcode = "agent.cli:entrypoint"
 # `adapters` is a real package, not a stray directory: the Terminal-Bench
 # harness imports adapters.terminal_bench:CliAgent by path.
 packages = ["agent", "adapters"]
+
+[tool.setuptools.dynamic]
+version = { attr = "agent.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
