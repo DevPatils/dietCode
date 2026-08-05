@@ -201,6 +201,74 @@ def test_traversal_out_of_the_working_directory_is_noticed(gate_factory, tmp_pat
     assert approver.seen[0].outside_root is True
 
 
+# -- what the CLI does by default -------------------------------------------
+
+
+def test_the_default_is_your_directory_not_a_container():
+    """`dietcode` with no flags works where you are standing."""
+    from agent.cli import build_parser, wants_sandbox
+
+    assert wants_sandbox(build_parser().parse_args([])) is False
+    assert wants_sandbox(build_parser().parse_args(["do a thing"])) is False
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--sandbox"],
+        ["--mount", "./x"],       # mounting only means anything in a container
+        ["--container", "abc"],
+        ["--no-network"],         # so does cutting the network
+    ],
+)
+def test_container_flags_opt_into_the_sandbox(argv):
+    """Otherwise these would be silently ignored, which is worse than an error."""
+    from agent.cli import build_parser, wants_sandbox
+
+    assert wants_sandbox(build_parser().parse_args(argv)) is True
+
+
+def test_the_old_here_flag_still_parses():
+    """People have `--here` and `--local` in their shell history."""
+    from agent.cli import build_parser, wants_sandbox
+
+    for flag in ("--here", "--local"):
+        assert wants_sandbox(build_parser().parse_args([flag])) is False
+
+
+def test_the_default_still_asks_before_writing(tmp_path):
+    """Removing the container removes containment; consent is what is left, so
+    it must not have been removed with it."""
+    import io
+
+    from rich.console import Console
+
+    from agent.cli import build_parser, make_executor
+
+    args = build_parser().parse_args(["--workdir", str(tmp_path)])
+    console = Console(file=io.StringIO())
+    executor, mounts = make_executor(args, console)
+
+    assert isinstance(executor, PermissionGate)
+    assert executor.policy.yes_to_everything is False
+    assert mounts == []
+
+
+def test_yes_disables_the_gate_and_says_so(tmp_path):
+    import io
+
+    from rich.console import Console
+
+    from agent.cli import build_parser, make_executor
+
+    args = build_parser().parse_args(["--yes", "--workdir", str(tmp_path)])
+    buffer = io.StringIO()
+    executor, _ = make_executor(args, Console(file=buffer, no_color=True))
+
+    assert executor.policy.yes_to_everything is True
+    assert "without asking" in buffer.getvalue()
+
+
 # -- policies ---------------------------------------------------------------
 
 

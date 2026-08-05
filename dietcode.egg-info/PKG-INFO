@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: dietcode
-Version: 0.2.0
+Version: 0.3.0
 Summary: A CLI coding agent that writes and runs code in a sandbox.
 Author: DevPatils
 License: MIT
@@ -31,7 +31,8 @@ Dynamic: license-file
 # CLI Coding Agent
 
 A command-line coding agent: an agentic loop with tool-calling that reads/writes
-files and runs shell commands in a Docker sandbox until a task is done. No agent
+files and runs shell commands until a task is done — in your own directory,
+asking before each change, or inside a Docker container. No agent
 framework — raw OpenAI-compatible API calls against Groq and a hand-rolled loop.
 
 Benchmarked against Terminal-Bench.
@@ -42,8 +43,7 @@ Benchmarked against Terminal-Bench.
 pipx install dietcode
 ```
 
-Needs **Python 3.11+**. Docker is optional — without it, use `dietcode --here`
-to work in the current directory instead of a container.
+Needs **Python 3.11+**. Docker is optional and only used by `--sandbox`.
 
 `pipx` is recommended because it puts `dietcode` on your PATH and keeps its
 dependencies isolated. `pip install --user dietcode` works too, but on Windows
@@ -75,12 +75,12 @@ Any OpenAI-compatible endpoint works via `--base-url` (Ollama, vLLM, OpenRouter)
 Now run it from anywhere:
 
 ```bash
-mkdir agent-work
-dietcode --mount ./agent-work
+cd ~/some-project
+dietcode
 ```
 
-The first run pulls the `python:3.11-slim` image (~150 MB); after that startup
-is about a second.
+It works in the directory you are standing in, and asks before anything that
+writes, deletes, or reaches outside it. Docker is not required.
 
 <details>
 <summary>Running from a checkout instead</summary>
@@ -89,7 +89,7 @@ is about a second.
 git clone https://github.com/DevPatils/dietCode.git
 cd dietCode
 pip install -e ".[dev]"
-python cli.py --mount ./agent-work    # same code as the installed command
+python cli.py                         # same code as the installed command
 ```
 
 A `.env` with `GROQ_API_KEY=...` also works when running from a checkout.
@@ -102,36 +102,39 @@ A `.env` with `GROQ_API_KEY=...` also works when running from a checkout.
 | --- | --- |
 | `dietcode: command not found` | its Scripts/bin dir is not on PATH — use `pipx` |
 | `no credentials for ...` | run `dietcode login` |
-| Docker errors | Docker isn't running — or use `dietcode --here` |
-| files disappear after a run | no `--mount` — see below |
+| Docker errors with `--sandbox` | Docker isn't running — drop the flag to work locally |
+| files disappear after a run | you used `--sandbox` without `--mount` |
 
 ## Two ways to run
 
 | | What it does | Safety |
 | --- | --- | --- |
-| `dietcode --mount ./dir` | Runs in a container; `dir` is mounted in | Containment — the agent cannot reach anything else |
-| `dietcode --here` | Runs in your current directory | Consent — asks before each command |
+| `dietcode` | Works in the current directory | Consent — asks before each change |
+| `dietcode --sandbox` | Runs inside a Docker container | Containment — cannot reach anything you did not mount |
 
-`--here` is the one that behaves like a normal dev tool. Read-only commands
-(`ls`, `cat`, `git status`) run without asking; anything that writes, deletes,
-or reaches outside the directory prompts first, with `[y] yes  [a] always
-allow  [n] no`. `--yes` skips all prompts and is exactly as dangerous as it
-sounds.
+**The default asks.** Read-only commands (`ls`, `cat`, `git status`) run
+without prompting; anything that writes, deletes, or reaches outside the
+directory stops first with `[y] yes  [a] always allow  [n] no`. `--yes` skips
+every prompt and is exactly as dangerous as it sounds.
 
-Be clear about the difference: the container is a boundary, the prompt is a
-decision. A shell command can always `cd ..`, so `--here` protects you by
-showing you what is about to happen, not by making escape impossible. For code
-you do not trust, use the sandbox.
+**The sandbox contains.** `--sandbox` puts everything in a container capped at
+2 GB memory, 2 CPUs and 512 PIDs. Add `--mount ./dir` to let files persist, or
+`--no-network` to cut it off entirely. Either flag implies `--sandbox`.
+
+The difference matters: a container is a boundary, a prompt is a decision. A
+shell command can always `cd ..`, so the default protects you by showing what
+is about to happen, not by making escape impossible. For code you do not
+trust, use `--sandbox`.
 
 ## Usage
 
-Run with no arguments for an interactive session:
+Run with no arguments for an interactive session in the current directory:
 
 ```bash
-dietcode --mount ./agent-work
+dietcode
 ```
 
-One container and one conversation for the whole session — the agent remembers
+One session keeps its conversation and its files — the agent remembers
 what it did on previous turns and the files it built are still there. Slash
 commands: `/help`, `/files`, `/cost`, `/sandbox`, `/clear` (forget the
 conversation, keep the files), `/exit`. Ctrl+C interrupts a turn without
@@ -140,15 +143,15 @@ quitting.
 Or pass a task to run once and exit — used for scripting and the benchmark:
 
 ```bash
-python cli.py "write a python script that prints the first 20 primes and run it"
+dietcode "add a test for the parser and make it pass"
 ```
 
-By default the agent works in a throwaway container, so **anything it writes is
-discarded when the run ends**. To keep the files, mount a directory — the agent
-stays sandboxed, but `/workspace` is now a real folder on your machine:
+To run the same thing inside a container instead, add `--sandbox`. Note that a
+container is thrown away when the run ends, so mount a directory if you want
+the files to survive:
 
 ```bash
-python cli.py --mount ./my-project "add a test for the parser and make it pass"
+dietcode --sandbox --mount ./my-project "add a test for the parser"
 ```
 
 | Flag | Meaning |
@@ -164,8 +167,9 @@ python cli.py --mount ./my-project "add a test for the parser and make it pass"
 | `--context-budget N` | trim the oldest turns above this prompt size (default 48000) |
 | `--memory` / `--cpus` / `--pids-limit` | container resource caps (default 2g / 2 / 512) |
 | `--cleanup` | remove every leftover agent container and exit |
-| `--mount HOSTDIR[:TARGET]` | bind-mount a host directory into the sandbox so the agent's files persist (default target `/workspace`). Repeatable |
-| `--local` | run on the host instead of Docker (no isolation — dev only) |
+| `--sandbox` | run inside a Docker container instead of the current directory |
+| `--mount HOSTDIR[:TARGET]` | bind-mount a directory into the container. Implies `--sandbox` |
+| `--yes` | approve every action without asking (dangerous) |
 | `--container NAME` | attach to an existing container instead of creating one |
 | `--image IMAGE` | sandbox image (default `python:3.11-slim`) |
 | `--model NAME` | default `llama-3.3-70b-versatile` |

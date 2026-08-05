@@ -499,9 +499,15 @@ def banner(
 
     # The one-line notice under the panel, where Claude Code puts its news.
     if local:
+        # Working in your own files is the normal case now, so this reports the
+        # protection rather than raising an alarm. The genuinely dangerous state
+        # is --yes, which the CLI shouts about separately.
         console.print(
-            f" [{WARN}]{glyph('arrow')}[/{WARN}] [{WARN}]unsandboxed: the model's "
-            f"shell commands run as you[/{WARN}]\n"
+            f" [{NOTE}]{glyph('arrow')}[/{NOTE}] [{MUTED}]working in your files "
+            f"{glyph('dot')} asks before anything that writes, deletes, or "
+            f"leaves this folder[/{MUTED}]\n",
+            no_wrap=True,
+            overflow="ellipsis",
         )
     elif not mounts:
         console.print(
@@ -531,15 +537,24 @@ def _identity_block(
     lines: list[Text] = list(logo_lines())
     lines.append(Text(""))
 
-    isolation = "unsandboxed" if local else "sandboxed"
     lines.append(
         Text.from_markup(
             f"[{NOTE}]{model}[/{NOTE}] [{MUTED}]{glyph('dot')}[/{MUTED}] "
-            + (f"[{FAIL}] {isolation} [/{FAIL}]" if local else f"[{DETAIL}]{isolation}[/{DETAIL}]")
+            + (
+                f"[{DETAIL}]asks first[/{DETAIL}]"
+                if local
+                else f"[{DETAIL}]sandboxed[/{DETAIL}]"
+            )
         )
     )
-    if not local:
-        lines.append(Text(f"container {sandbox[:26]}", style=MUTED))
+    # `sandbox` is the container name when there is one, the working directory
+    # otherwise -- either way it is the answer to "where is this happening".
+    lines.append(
+        Text(
+            _shorten(sandbox, LOGO_WIDTH - 4) if local else f"container {sandbox[:26]}",
+            style=MUTED,
+        )
+    )
     for host, target in mounts:
         lines.append(
             Text.from_markup(

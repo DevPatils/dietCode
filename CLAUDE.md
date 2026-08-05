@@ -16,7 +16,8 @@ pip install -e ".[dev]"                    # editable install; provides the `die
 python -m pytest                           # full suite; Docker tests skip if the daemon is down
 python -m pytest tests/test_loop.py        # one file
 python -m pytest -k "timeout"              # one test by name
-dietcode "task description"                # the installed command
+dietcode "task description"                # runs in the current directory, asking first
+dietcode --sandbox "task description"      # runs in a container instead
 python cli.py "task description"           # same code, from a checkout
 ```
 

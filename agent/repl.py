@@ -379,7 +379,7 @@ class Session:
         banner(
             self.console,
             self.model,
-            getattr(self.executor, "container", "local"),
+            str(getattr(self.executor, "container", None) or getattr(self.executor, "root", ".")),
             self.mounts,
             self.local,
         )

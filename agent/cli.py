@@ -96,27 +96,34 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"trim the oldest turns above this prompt size (default {DEFAULT_CONTEXT_BUDGET})",
     )
 
-    sandbox = parser.add_argument_group("sandbox")
+    sandbox = parser.add_argument_group("where it runs")
+    # Default is the current directory. Docker is opt-in, because most people
+    # want an agent that works on the project they are standing in, and the
+    # permission gate is what keeps that safe.
+    sandbox.add_argument(
+        "--sandbox",
+        action="store_true",
+        help="run inside a Docker container instead of the current directory",
+    )
     sandbox.add_argument(
         "--mount",
         action="append",
         metavar="HOSTDIR[:TARGET]",
-        help="bind-mount a host directory into the sandbox so files persist "
-        "(default target /workspace). Repeatable.",
+        help="with --sandbox, bind-mount a host directory into the container "
+        "(default target /workspace). Repeatable. Implies --sandbox.",
     )
     sandbox.add_argument(
         "--here",
         "--local",
         dest="here",
         action="store_true",
-        help="work in the current directory on your machine, asking before each "
-        "command (no container)",
+        help=argparse.SUPPRESS,  # now the default; kept so old commands still work
     )
-    sandbox.add_argument("--workdir", default=".", help="directory to work in with --here")
+    sandbox.add_argument("--workdir", default=".", help="directory to work in")
     sandbox.add_argument(
         "--yes",
         action="store_true",
-        help="with --here, approve every action without asking (dangerous)",
+        help="approve every action without asking (dangerous)",
     )
     sandbox.add_argument("--image", default=DEFAULT_IMAGE, help="sandbox container image")
     sandbox.add_argument(
@@ -182,8 +189,14 @@ def resolve_model_config(args: argparse.Namespace) -> tuple[str, str, str]:
     return api_key, args.base_url or spec.base_url, args.model or spec.default_model
 
 
+def wants_sandbox(args: argparse.Namespace) -> bool:
+    """Docker is opt-in. --mount only means anything inside a container, so it
+    implies --sandbox rather than being silently ignored."""
+    return bool(args.sandbox or args.container or args.mount or args.no_network)
+
+
 def make_executor(args: argparse.Namespace, console: Console) -> tuple[Any, list]:
-    if args.here:
+    if not wants_sandbox(args):
         root = Path(args.workdir).resolve()
         inner = LocalExecutor(root)
 
@@ -234,7 +247,9 @@ def build_agent_extras(
     extras: dict[str, Any] = {}
 
     if getattr(args, "context", True):
-        context, source = load_project_context(args.workdir if args.here else ".")
+        context, source = load_project_context(
+                "." if wants_sandbox(args) else args.workdir
+            )
         if source:
             extras["system_prompt"] = with_project_context(SYSTEM_PROMPT, context, source)
             console.print(f"[dim]using project instructions from {source}[/dim]")
@@ -346,7 +361,7 @@ def main(argv: list[str] | None = None) -> int:
         console.print(f"[red]{exc}[/red]")
         return 2
 
-    if not args.here:
+    if wants_sandbox(args):
         # Reap anything a previous crash left behind. Age-based, so a container
         # belonging to another session running right now is left alone.
         stale = DockerExecutor.sweep_orphans()
@@ -377,7 +392,7 @@ def main(argv: list[str] | None = None) -> int:
             model=model,
             max_iterations=args.max_iterations,
             mounts=mounts,
-            local=args.here,
+            local=not wants_sandbox(args),
             show_steps=args.steps,
             stream=args.stream,
             context_budget=args.context_budget,

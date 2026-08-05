@@ -68,6 +68,14 @@ def main() -> int:
     resolved = [r for r in rows if r["resolved"]]
     ran = [r for r in rows if r["agent_status"] != "?"]
 
+    # A task that spent zero tokens and errored never reached the model at all
+    # -- almost always the daily quota. Counting those as failures understates
+    # the agent, so they are excluded from the rate and reported separately.
+    never_ran = [
+        r for r in rows if r["tokens"] == 0 and r["agent_status"] in ("error", "?")
+    ]
+    scored = [r for r in rows if r not in never_ran]
+
     print(f"{'task':<28} {'result':<9} {'tests':<7} {'status':<22} {'steps':>5} {'tokens':>8} {'rec':>4}")
     print("-" * 92)
     for r in rows:
@@ -78,8 +86,11 @@ def main() -> int:
         )
 
     print("-" * 92)
-    rate = len(resolved) / len(rows) * 100
-    print(f"resolved         {len(resolved)}/{len(rows)}  ({rate:.1f}%)")
+    rate = len(resolved) / len(scored) * 100 if scored else 0.0
+    print(f"resolved         {len(resolved)}/{len(scored)}  ({rate:.1f}%)")
+    if never_ran:
+        names = ", ".join(r["task"] for r in never_ran)
+        print(f"never ran        {len(never_ran)}  (0 tokens spent — quota) — {names}")
     if ran:
         print(f"avg steps        {sum(r['steps'] for r in ran) / len(ran):.1f}")
         print(f"avg tokens       {sum(r['tokens'] for r in ran) / len(ran):,.0f}")
