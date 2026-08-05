@@ -52,7 +52,11 @@ PROVIDERS: dict[str, Provider] = {
         label="Google Gemini",
         # Gemini speaks the OpenAI protocol at this path, so the same client works.
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-        default_model="gemini-2.5-flash",
+        # An alias, not a pinned version. Google retires model ids and gates
+        # older ones to existing accounts, so a hardcoded `gemini-2.5-flash`
+        # started returning 404 "no longer available to new users" for anyone
+        # signing up after it shipped. `-latest` follows the current model.
+        default_model="gemini-flash-latest",
         env_var="GEMINI_API_KEY",
         signup_url="https://aistudio.google.com/apikey",
     ),

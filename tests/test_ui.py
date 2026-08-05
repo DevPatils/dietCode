@@ -416,9 +416,11 @@ def test_switching_provider_without_a_key_is_refused(session, monkeypatch):
 def test_switching_provider_updates_model_and_client(session, monkeypatch):
     monkeypatch.setattr("agent.repl.resolve_key", lambda name: ("k", "saved login"))
     monkeypatch.setattr("agent.repl.make_client", lambda **kw: "new-client")
+    from agent.auth import PROVIDERS
+
     session.handle_command("/provider gemini")
     assert session.provider == "gemini"
-    assert session.model == "gemini-2.5-flash"
+    assert session.model == PROVIDERS["gemini"].default_model
     assert session.client == "new-client"
 
 
