@@ -52,8 +52,8 @@ FALLBACK_MODELS: dict[str, tuple[str, ...]] = {
         "qwen/qwen3-32b",
     ),
     "gemini": (
-        "gemini-flash-latest",
         "gemini-flash-lite-latest",
+        "gemini-flash-latest",
         "gemini-2.5-pro",
     ),
     "openai": (

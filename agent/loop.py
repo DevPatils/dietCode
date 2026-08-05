@@ -380,7 +380,12 @@ def is_quota_exhausted(exc: Exception) -> bool:
     fails anyway -- which is exactly what happened to a benchmark run.
     """
     text = str(exc).lower()
-    return "per day" in text or "tpd" in text or "rpd" in text
+    if "per day" in text or "tpd" in text or "rpd" in text:
+        return True
+    # Gemini words it differently and never says "per day" in the message --
+    # the daily part is only in the quotaId. Missing it cost 22 seconds of
+    # backoff per turn against a cap that does not clear until tomorrow.
+    return "exceeded your current quota" in text and "perday" in text.replace("-", "")
 
 
 def _is_transient(exc: Exception) -> bool:

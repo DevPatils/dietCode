@@ -737,3 +737,79 @@ def test_switching_provider_keeps_the_subagent_tool(session, monkeypatch):
     names = [t["function"]["name"] for t in session.extras["tools"]]
     assert "spawn_subagent" in names
     assert len(names) == len(set(names)), "a tool was added twice"
+
+
+# -- Gemini's daily quota ---------------------------------------------------
+#
+# Reported live: a fresh login, then every turn failing with "rate limited /
+# too many requests just now" after 22 seconds of backoff. It was neither a
+# burst limit nor worth retrying -- the free tier allows 20 requests a day per
+# model, and one loop step is one request. The body below is the real one.
+
+GEMINI_DAILY_QUOTA = (
+    "LLM call failed: Error code: 429 - [{'error': {'code': 429, 'message': "
+    "'You exceeded your current quota, please check your plan and billing details. "
+    "For more information on this error, head to: "
+    "https://ai.google.dev/gemini-api/docs/rate-limits.\n"
+    "* Quota exceeded for metric: "
+    "generativelanguage.googleapis.com/generate_content_free_tier_requests, "
+    "limit: 20, model: gemini-3.6-flash\nPlease retry in 48.109618264s.', "
+    "'status': 'RESOURCE_EXHAUSTED', 'details': [{'@type': "
+    "'type.googleapis.com/google.rpc.QuotaFailure', 'violations': [{'quotaId': "
+    "'GenerateRequestsPerDayPerProjectPerModel-FreeTier', 'quotaValue': '20'}]}]}}]"
+)
+
+
+def test_a_daily_quota_does_not_read_as_a_passing_burst_limit():
+    from agent.ui import humanize_error
+
+    headline, hint = humanize_error(GEMINI_DAILY_QUOTA)
+    assert "daily" in headline
+    assert "gemini-3.6-flash" in headline, "say which model ran out"
+    assert "20 requests a day" in hint
+    assert "just now" not in hint, "implies waiting a moment helps; it does not"
+
+
+def test_the_quota_message_says_how_to_get_working_again():
+    from agent.ui import humanize_error
+
+    _headline, hint = humanize_error(GEMINI_DAILY_QUOTA)
+    assert "/model" in hint and "/provider" in hint
+
+
+def test_a_model_the_plan_does_not_include_is_not_called_a_quota():
+    """limit: 0 means never allowed, not used up -- waiting will not help."""
+    from agent.ui import humanize_error
+
+    headline, hint = humanize_error(
+        GEMINI_DAILY_QUOTA.replace("limit: 20, model: gemini-3.6-flash", "limit: 0, model: gemini-2.0-flash")
+    )
+    assert "not available on your plan" in headline
+    assert "/model" in hint
+
+
+def test_a_per_minute_limit_is_still_reported_as_temporary():
+    """The new branch must not swallow the burst case, which does clear."""
+    from agent.ui import humanize_error
+
+    headline, hint = humanize_error(
+        "Error code: 429 - rate limit reached on tokens per minute, "
+        "please try again in 12.5s"
+    )
+    assert headline == "rate limited"
+    assert "12.5s" in hint
+
+
+def test_a_daily_quota_is_not_retried():
+    """22 seconds of backoff against a cap that clears tomorrow."""
+    from agent.loop import is_quota_exhausted
+
+    assert is_quota_exhausted(RuntimeError(GEMINI_DAILY_QUOTA))
+
+
+def test_a_burst_limit_is_still_retried():
+    from agent.loop import is_quota_exhausted
+
+    assert not is_quota_exhausted(
+        RuntimeError("429 rate limit reached, please try again in 12.5s")
+    )

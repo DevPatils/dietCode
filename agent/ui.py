@@ -160,10 +160,30 @@ def humanize_error(message: str) -> tuple[str, str]:
     text = message or "unknown error"
     low = text.lower()
 
-    if "rate limit" in low or "429" in low:
+    if "rate limit" in low or "429" in low or "exceeded your current quota" in low:
         used = re.search(r"Used (\d+)", text)
         limit = re.search(r"Limit (\d+)", text)
         retry = re.search(r"try again in ([0-9hms.]+)", text)
+
+        # Gemini's daily cap. Worth its own branch because the numbers that
+        # matter are only in the QuotaFailure detail, and the generic "rate
+        # limited / too many requests just now" reads as "wait a moment" when
+        # the truth is "not until tomorrow, on this model".
+        quota = re.search(r"limit: (\d+), model: ([\w.-]+)", text)
+        daily = "perday" in low.replace("-", "")
+        if quota and daily:
+            allowed, model_id = quota.group(1), quota.group(2)
+            if allowed == "0":
+                return (
+                    f"{model_id} is not available on your plan",
+                    "the free tier allows 0 requests for it — switch with /model",
+                )
+            return (
+                f"daily quota used up for {model_id}",
+                f"the free tier allows {allowed} requests a day for that model "
+                f"— switch with /model, or change provider with /provider",
+            )
+
         if "per day" in low or "tpd" in low:
             headline = "daily token quota exhausted"
             detail = (

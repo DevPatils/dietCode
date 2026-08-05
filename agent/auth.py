@@ -56,7 +56,13 @@ PROVIDERS: dict[str, Provider] = {
         # older ones to existing accounts, so a hardcoded `gemini-2.5-flash`
         # started returning 404 "no longer available to new users" for anyone
         # signing up after it shipped. `-latest` follows the current model.
-        default_model="gemini-flash-latest",
+        #
+        # Lite rather than plain flash, which is the better model: the free
+        # tier allows 20 requests per day per model, and one loop step is one
+        # request, so flash is spent after three or four tasks. A default that
+        # 429s on someone's first session is worse than a smaller model.
+        # `/model gemini-flash-latest` is one command away.
+        default_model="gemini-flash-lite-latest",
         env_var="GEMINI_API_KEY",
         signup_url="https://aistudio.google.com/apikey",
     ),
