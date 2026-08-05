@@ -1,4 +1,4 @@
-__version__ = "0.4.1"
+﻿__version__ = "0.4.2"
 
 from .loop import AgentResult, agent_loop, make_client
 from .sandbox import DockerExecutor, Executor, LocalExecutor, SandboxError, ShellResult

@@ -198,26 +198,38 @@ def make_client(
     )
 
 
+# Fields a provider attaches to a tool call that are not part of the OpenAI
+# schema but must survive the round trip. Gemini 3 returns
+# extra_content.google.thought_signature and rejects the next request with a
+# 400 if it is not echoed back -- rebuilding the assistant turn from just
+# id/type/function silently drops it and every tool-using conversation dies on
+# its second step.
+def _passthrough_fields(call: Any) -> dict[str, Any]:
+    if isinstance(call, dict):
+        return {
+            k: v for k, v in call.items() if k not in ("id", "type", "function")
+        }
+    return dict(getattr(call, "model_extra", None) or {})
+
+
 def _tool_call_to_dict(call: Any) -> dict[str, Any]:
     """Normalize an SDK tool call object (or dict) into a plain dict."""
     if isinstance(call, dict):
         fn = call.get("function") or {}
-        return {
-            "id": call.get("id") or "",
-            "type": "function",
-            "function": {
-                "name": fn.get("name") or "",
-                "arguments": fn.get("arguments") or "",
-            },
-        }
-    fn = getattr(call, "function", None)
+        name = fn.get("name") or ""
+        arguments = fn.get("arguments") or ""
+        call_id = call.get("id") or ""
+    else:
+        fn = getattr(call, "function", None)
+        name = getattr(fn, "name", "") or ""
+        arguments = getattr(fn, "arguments", "") or ""
+        call_id = getattr(call, "id", "") or ""
+
     return {
-        "id": getattr(call, "id", "") or "",
+        "id": call_id,
         "type": "function",
-        "function": {
-            "name": getattr(fn, "name", "") or "",
-            "arguments": getattr(fn, "arguments", "") or "",
-        },
+        "function": {"name": name, "arguments": arguments},
+        **_passthrough_fields(call),
     }
 
 
@@ -439,6 +451,7 @@ def _from_stream(stream: Any, on_text: Callable[[str], None] | None) -> Completi
     """
     parts: list[str] = []
     slots: dict[int, dict[str, str]] = {}
+    extras: dict[int, dict[str, Any]] = {}
     usage = None
 
     for chunk in stream:
@@ -465,6 +478,9 @@ def _from_stream(stream: Any, on_text: Callable[[str], None] | None) -> Completi
             slot = slots.setdefault(
                 index, {"id": "", "name": "", "arguments": "", "_last_name": ""}
             )
+            # Provider-specific fields (Gemini's thought_signature) arrive on
+            # whichever fragment carries them and must survive reassembly too.
+            extras.setdefault(index, {}).update(_passthrough_fields(raw))
             call_id = getattr(raw, "id", None)
             if call_id:
                 slot["id"] = call_id
@@ -487,8 +503,9 @@ def _from_stream(stream: Any, on_text: Callable[[str], None] | None) -> Completi
             "id": slot["id"],
             "type": "function",
             "function": {"name": slot["name"], "arguments": slot["arguments"]},
+            **extras.get(index, {}),
         }
-        for _index, slot in sorted(slots.items())
+        for index, slot in sorted(slots.items())
     ]
     return Completion(content="".join(parts), tool_calls=calls, usage=usage)
 

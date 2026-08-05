@@ -12,7 +12,16 @@ from agent.loop import (
     make_client,
 )
 from agent.sandbox import LocalExecutor
-from tests.fake_llm import ExplodingClient, FakeClient, sdk_error, tool_call, turn
+from tests.fake_llm import (
+    ExplodingClient,
+    FakeChoice,
+    FakeClient,
+    FakeMessage,
+    FakeResponse,
+    sdk_error,
+    tool_call,
+    turn,
+)
 
 
 @pytest.fixture
@@ -406,6 +415,71 @@ def test_hallucinated_tool_name_is_fed_back(executor):
 def test_task_complete_with_malformed_arguments_still_completes(executor):
     result, _ = run([turn(tool_call("task_complete", "{broken"))], executor)
     assert result.status == "complete"
+
+
+# -- provider-specific fields on a tool call --------------------------------
+#
+# Gemini 3 attaches extra_content.google.thought_signature to every tool call
+# and rejects the *next* request with a 400 if it is not echoed back. Rebuilding
+# the assistant turn from just id/type/function drops it, so every tool-using
+# conversation died on step two.
+
+
+class _ExtraCall:
+    """Mimics an SDK tool call carrying an unknown field, as pydantic exposes it."""
+
+    def __init__(self, name, arguments, extra):
+        self.id = "c1"
+        self.type = "function"
+        self.function = type("F", (), {"name": name, "arguments": arguments})()
+        self.model_extra = extra
+
+
+SIGNATURE = {"extra_content": {"google": {"thought_signature": "abc123"}}}
+
+
+def test_unknown_tool_call_fields_survive_the_round_trip():
+    from agent.loop import _tool_call_to_dict
+
+    out = _tool_call_to_dict(_ExtraCall("read_file", '{"path":"x"}', SIGNATURE))
+    assert out["function"]["name"] == "read_file"
+    assert out["extra_content"] == SIGNATURE["extra_content"]
+
+
+def test_a_tool_call_without_extras_is_unchanged():
+    from agent.loop import _tool_call_to_dict
+
+    out = _tool_call_to_dict(_ExtraCall("read_file", "{}", {}))
+    assert set(out) == {"id", "type", "function"}
+
+
+def test_the_signature_is_sent_back_on_the_next_request(executor):
+    """The end-to-end version: what the model returns must reach the API again."""
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+            self.chat = self
+            self.completions = self
+            self._turn = 0
+
+        def create(self, *, messages, **kwargs):
+            self.calls.append([dict(m) for m in messages])
+            self._turn += 1
+            if self._turn == 1:
+                message = FakeMessage(
+                    content="", tool_calls=[_ExtraCall("run_shell", '{"command":"ls"}', SIGNATURE)]
+                )
+                return FakeResponse(choices=[FakeChoice(message)])
+            return turn(tool_call("task_complete", {"summary": "done"}))
+
+    client = Client()
+    result = agent_loop("task", executor, client=client)
+    assert result.status == "complete"
+
+    sent = client.calls[1]
+    assistant = next(m for m in sent if m["role"] == "assistant" and m.get("tool_calls"))
+    assert assistant["tool_calls"][0]["extra_content"] == SIGNATURE["extra_content"]
 
 
 # -- conversation history ---------------------------------------------------

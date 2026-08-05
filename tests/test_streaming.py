@@ -283,3 +283,36 @@ def test_json_arguments_are_valid_after_reassembly(executor):
     agent_loop("task", executor, client=client, stream=True, max_iterations=1)
     # If reassembly were wrong this would not parse.
     assert json.loads(json.dumps(payload)) == payload
+
+
+def test_provider_extras_survive_stream_reassembly(executor):
+    """Gemini attaches a thought_signature to a streamed tool call too, and the
+    next request is rejected without it."""
+
+    class ExtraDelta:
+        def __init__(self, name=None, arguments=None, extra=None):
+            self.index = 0
+            self.id = "c1" if name else None
+            self.function = FakeDeltaFunction(name=name, arguments=arguments)
+            self.model_extra = extra or {}
+
+    signature = {"extra_content": {"google": {"thought_signature": "sig-xyz"}}}
+    client = RawStreamClient(
+        [
+            [
+                FakeChunk([FakeStreamChoice(FakeDelta(
+                    tool_calls=[ExtraDelta("task_complete", '{"summary":', signature)]
+                ))]),
+                FakeChunk([FakeStreamChoice(FakeDelta(
+                    tool_calls=[ExtraDelta(arguments=' "ok"}')]
+                ))]),
+            ]
+        ]
+    )
+    result = agent_loop("task", executor, client=client, stream=True)
+    assert result.status == "complete"
+
+    assistant = next(
+        m for m in result.messages if m["role"] == "assistant" and m.get("tool_calls")
+    )
+    assert assistant["tool_calls"][0]["extra_content"] == signature["extra_content"]
