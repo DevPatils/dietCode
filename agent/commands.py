@@ -25,37 +25,30 @@ from .auth import (
     set_default_provider,
     store_key,
 )
+from .prompts import Choice, ask_secret, choose
 from .ui import BRAND, DETAIL, FAIL, MUTED, NOTE, OK, TOOL, WARN, glyph
-
-
-def _prompt_secret(console: Console, label: str) -> str:
-    """Read a key without echoing it."""
-    import getpass
-
-    if not sys.stdin.isatty():
-        # Piped input: read a line so `echo $KEY | dietcode login` works.
-        return sys.stdin.readline().strip()
-    try:
-        return getpass.getpass(f"{label}: ")
-    except (EOFError, KeyboardInterrupt):
-        console.print()
-        return ""
 
 
 def login(console: Console, provider: str | None, api_key: str | None) -> int:
     """Save an API key for a provider."""
     if provider is None:
-        console.print(f"[{TOOL}]Which provider?[/{TOOL}]")
-        for spec in PROVIDERS.values():
+        provider = choose(
+            console,
+            "Which provider?",
+            [
+                Choice(spec.name, spec.label, f"free tier {glyph('dot')} {spec.signup_url}"
+                       if spec.name in ("groq", "gemini") else spec.signup_url)
+                for spec in PROVIDERS.values()
+            ],
+        )
+        if provider is None:
+            # Also the path a piped run takes: there is nobody to ask, so say
+            # which flag would have answered the question.
             console.print(
-                f"  [{NOTE}]{spec.name:<8}[/{NOTE}] [{MUTED}]{spec.label} "
-                f"{glyph('dot')} keys at {spec.signup_url}[/{MUTED}]"
+                f"[{MUTED}]cancelled[/{MUTED}] "
+                f"[{MUTED}]{glyph('dash')} or name one: "
+                f"dietcode login --provider {'|'.join(PROVIDERS)}[/{MUTED}]"
             )
-        console.print()
-        try:
-            provider = input(f"provider [{list(PROVIDERS)[0]}]: ").strip() or list(PROVIDERS)[0]
-        except (EOFError, KeyboardInterrupt):
-            console.print()
             return 130
 
     try:
@@ -69,7 +62,7 @@ def login(console: Console, provider: str | None, api_key: str | None) -> int:
             f"[{MUTED}]Get a key at {spec.signup_url} "
             f"{glyph('dot')} input is hidden[/{MUTED}]"
         )
-        api_key = _prompt_secret(console, f"{spec.label} API key")
+        api_key = ask_secret(f"{spec.label} API key")
 
     api_key = clean_key(api_key or "")
     if not api_key:
@@ -172,12 +165,13 @@ def doctor(console: Console) -> int:
 
     docker = shutil.which("docker")
     if docker is None:
+        # Not a failure: Docker is only needed for --sandbox, so reporting it
+        # as broken would send people chasing an install they do not need.
         report(
-            False,
+            True,
             "docker",
             "not installed",
-            "optional: without it use `dietcode --here` to work in the current "
-            "directory instead of a container",
+            "optional -- only needed for `dietcode --sandbox`",
         )
     else:
         try:
@@ -196,7 +190,7 @@ def doctor(console: Console) -> int:
             running,
             "docker",
             detail,
-            "start Docker Desktop, or use `dietcode --here` to skip the sandbox",
+            "only needed for --sandbox; start Docker Desktop if you want it",
         )
 
     configured = [spec.name for spec, masked, _ in credential_status() if masked]
@@ -209,7 +203,7 @@ def doctor(console: Console) -> int:
 
     console.print()
     if ok:
-        console.print(f"[{OK}]{glyph('tick')} ready[/{OK}] [{MUTED}]try: dietcode --here[/{MUTED}]")
+        console.print(f"[{OK}]{glyph('tick')} ready[/{OK}] [{MUTED}]try: dietcode[/{MUTED}]")
         return 0
     console.print(f"[{WARN}]fix the items above, then run `dietcode doctor` again[/{WARN}]")
     return 1

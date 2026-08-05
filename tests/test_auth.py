@@ -258,3 +258,91 @@ def test_auth_status_never_prints_a_whole_key(console):
 def test_config_file_is_valid_json(tmp_path):
     auth.set_default_provider("groq")
     assert json.loads((tmp_path / "config.json").read_text())["provider"] == "groq"
+
+
+# -- the first run, with no key saved ---------------------------------------
+#
+# Dead-ending on "no credentials" made the user read the help, come back, and
+# run a different command. The entrypoint offers to fix it in place instead.
+
+
+@pytest.fixture
+def first_run(monkeypatch):
+    """main(), with .env ignored and everything past authentication stubbed.
+
+    Disabling load_dotenv matters more than it looks: without it, main() reads
+    the developer's own .env back into the environment that isolated_home just
+    cleared, and the test makes a real API call.
+    """
+    import dotenv
+
+    from agent import cli
+
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(
+        cli,
+        "make_executor",
+        lambda *_a, **_k: (_ for _ in ()).throw(SystemExit(99)),
+    )
+    return cli
+
+
+def test_a_missing_key_offers_to_set_one_up(first_run, monkeypatch):
+    asked = {}
+
+    def fake_login(_console, provider, _key):
+        asked["provider"] = provider
+        auth.store_key("groq", "gsk_saved_by_the_prompt")
+        return 0
+
+    monkeypatch.setattr(first_run, "confirm", lambda *_a, **_k: True)
+    monkeypatch.setattr(first_run, "login", fake_login)
+
+    with pytest.raises(SystemExit):  # got past auth, into executor setup
+        first_run.main(["hello"])
+    assert asked["provider"] is None, "login picks the provider when none was given"
+
+
+def test_the_offer_names_the_provider_that_was_asked_for(first_run, monkeypatch):
+    asked = {}
+
+    def fake_login(_console, provider, _key):
+        asked["provider"] = provider
+        auth.store_key("gemini", "AIza_x")
+        return 0
+
+    monkeypatch.setattr(first_run, "confirm", lambda *_a, **_k: True)
+    monkeypatch.setattr(first_run, "login", fake_login)
+
+    with pytest.raises(SystemExit):
+        first_run.main(["--provider", "gemini", "hello"])
+    assert asked["provider"] == "gemini"
+
+
+def test_declining_the_offer_exits_without_running(first_run, monkeypatch):
+    monkeypatch.setattr(first_run, "confirm", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        first_run, "login", lambda *_a: pytest.fail("must not log in after a no")
+    )
+    assert first_run.main(["hello"]) == 2
+
+
+def test_a_failed_login_does_not_start_a_run(first_run, monkeypatch):
+    monkeypatch.setattr(first_run, "confirm", lambda *_a, **_k: True)
+    monkeypatch.setattr(first_run, "login", lambda *_a: 1)
+    assert first_run.main(["hello"]) == 2
+
+
+def test_a_login_that_saves_nothing_is_not_treated_as_success(first_run, monkeypatch):
+    """login exits 0 for a provider other than the one this run needs."""
+    monkeypatch.setattr(first_run, "confirm", lambda *_a, **_k: True)
+    monkeypatch.setattr(first_run, "login", lambda *_a: 0)
+    assert first_run.main(["--provider", "groq", "hello"]) == 2
+
+
+def test_a_piped_run_reports_the_error_instead_of_prompting(first_run, monkeypatch):
+    """Nothing can answer a prompt in a script; hanging there would be worse."""
+    monkeypatch.setattr(first_run.sys.stdin, "isatty", lambda: False, raising=False)
+    monkeypatch.setattr(first_run, "confirm", lambda *_a, **_k: pytest.fail("prompted"))
+    assert first_run.main(["--provider", "groq", "hello"]) == 2

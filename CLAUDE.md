@@ -72,6 +72,11 @@ turn's `.messages` back in as `history` — that is the *only* behavioural diffe
 `history` is copied, not mutated, so an interrupted turn cannot leave the caller with
 a transcript containing unanswered tool calls (which the API rejects).
 
+Everything that reads a keypress lives in `agent/prompts.py` (pickers, confirm, secret
+entry) and `agent/completion.py` (slash completion). `agent/models.py` asks a provider
+what it will actually accept, filtering `/models` down to ids that can drive a
+tool-calling loop — an embedding id in the picker is a 400 waiting to happen.
+
 **Rendering stays in `agent/ui.py`.** The loop emits events and never prints, so the
 benchmark adapter runs it with no console attached. Anything that makes `agent_loop`
 aware of a terminal breaks that.
@@ -190,6 +195,28 @@ These encode failures already hit; changing them will silently break runs.
   prints, and `ui.glyph()` falls back to ASCII when the encoding is narrow. The same
   applies to rich's box-drawing: `banner()` picks `box.ASCII` from `ascii_only()`
   rather than trusting rich's terminal detection.
+- **Tool schemas are narrowed per provider on the way out** (`tools_for`). The union
+  types (`["integer","string"]`) exist because Groq validates the model's arguments
+  server-side; Gemini's schema layer is OpenAPI-derived and cannot express a union at
+  all. So `TOOLS` stays canonical and each provider gets its own shape. `_rebuild_client`
+  re-narrows on `/provider`, or the next turn 400s on a schema built for the provider
+  just left.
+- **Anything the user types at a prompt must be echoed by prompt_toolkit, not
+  `input()`.** `input()` writes straight to the terminal while rich is still repainting
+  a spinner over the same line, so the keystrokes vanish and the user answers the
+  permission gate blind. `ui._read_answer` and `prompts.confirm` both own the line.
+- **Enter approves only what is safe to approve by reflex.** The permission prompt
+  defaults to yes, because approving reads is most of what it does — but not for
+  `Risk.DANGEROUS` or anything `outside_root`.
+- **A picker with no terminal cancels; it never guesses.** `prompts.choose` returns
+  `None` when stdin is not a tty. Returning the first option would silently change a
+  provider or model in a scripted run.
+- **The suite makes no network calls, and `tests/conftest.py` enforces it.** A test that
+  called `main()` loaded the developer's `.env`, found a real key and spent tokens on a
+  live request. httpx is blocked; the Docker tests use requests and still work.
+- **`load_dotenv` must be given `find_dotenv(usecwd=True)`.** The default searches
+  upward from the calling *file*, which inside a pipx install is site-packages — so an
+  installed `dietcode` never saw the `.env` in the directory the user was standing in.
 
 ## Constraints from the plan
 

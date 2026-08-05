@@ -9,6 +9,7 @@ result so the model can see what it did wrong and correct on the next turn.
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from pathlib import PurePosixPath
@@ -171,6 +172,39 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 TOOL_NAMES = [t["function"]["name"] for t in TOOLS]
+
+# Providers whose schema layer cannot express a union type. Gemini's OpenAI
+# endpoint converts the schema into its own OpenAPI-derived form, where `type`
+# is a single string -- a list there is rejected outright, taking the whole
+# request with it. Groq is the opposite case (see the timeout comment above),
+# which is why the union stays canonical and gets narrowed per provider rather
+# than being dropped.
+SINGLE_TYPE_PROVIDERS = frozenset({"gemini"})
+
+
+def tools_for(provider: str, tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """The tool schemas as this provider will accept them.
+
+    Narrowing loses nothing at runtime: every union exists because models send
+    the wrong scalar type, and the dispatcher coerces it either way.
+    """
+    tools = TOOLS if tools is None else tools
+    if provider not in SINGLE_TYPE_PROVIDERS:
+        return list(tools)
+
+    narrowed = []
+    for tool in tools:
+        spec = copy.deepcopy(tool)
+        properties = (
+            spec.get("function", {}).get("parameters", {}).get("properties", {})
+        )
+        for schema in properties.values():
+            if isinstance(schema.get("type"), list) and schema["type"]:
+                # First entry is the real type; the alternates are only there to
+                # stop a server-side validator rejecting a coercible value.
+                schema["type"] = schema["type"][0]
+        narrowed.append(spec)
+    return narrowed
 
 
 # --- recovering tool calls the model wrote as prose -------------------------

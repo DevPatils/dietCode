@@ -505,3 +505,235 @@ def test_interrupted_turn_is_discarded(session):
     assert session.history == [{"role": "user", "content": "earlier"}]
     assert session.turns == 0
     assert "interrupted" in output(session.console)
+
+
+# -- the approval prompt ----------------------------------------------------
+
+
+@pytest.fixture
+def approver_factory(console, monkeypatch):
+    """Build an approver whose answer comes from a script, not a keyboard."""
+    from agent.ui import make_approver
+
+    def build(answer: str):
+        monkeypatch.setattr("agent.ui._read_answer", lambda: answer)
+        return make_approver(console)
+
+    return build
+
+
+def request_for(risk, *, outside_root=False, detail="rm -rf /tmp/x"):
+    from agent.permissions import Request, Risk
+
+    return Request(
+        action="run",
+        detail=detail,
+        risk=risk if isinstance(risk, Risk) else Risk(risk),
+        root="/work",
+        outside_root=outside_root,
+    )
+
+
+def test_the_answer_is_echoed_so_you_can_see_what_you_typed(approver_factory, console):
+    """The bug: the spinner repainted over the typed y and you answered blind."""
+    from agent.permissions import Decision, Risk
+
+    assert approver_factory("y")(request_for(Risk.MODIFIES)) is Decision.ONCE
+    assert "allowed" in output(console)
+
+
+def test_saying_no_is_echoed_too(approver_factory, console):
+    from agent.permissions import Decision, Risk
+
+    assert approver_factory("n")(request_for(Risk.MODIFIES)) is Decision.NO
+    assert "denied" in output(console)
+
+
+def test_always_names_what_it_is_remembering(approver_factory, console):
+    from agent.permissions import Decision, Risk
+
+    assert approver_factory("a")(request_for(Risk.MODIFIES)) is Decision.ALWAYS
+    assert "always allowing rm" in output(console)
+
+
+def test_enter_approves_ordinary_work(approver_factory):
+    from agent.permissions import Decision, Risk
+
+    assert approver_factory("")(request_for(Risk.READ_ONLY)) is Decision.ONCE
+
+
+def test_enter_does_not_approve_a_destructive_command(approver_factory):
+    """A reflex keypress must not be able to delete a tree."""
+    from agent.permissions import Decision, Risk
+
+    assert approver_factory("")(request_for(Risk.DANGEROUS)) is Decision.NO
+
+
+def test_enter_does_not_approve_work_outside_the_working_directory(approver_factory):
+    from agent.permissions import Decision, Risk
+
+    assert (
+        approver_factory("")(request_for(Risk.MODIFIES, outside_root=True))
+        is Decision.NO
+    )
+
+
+def test_an_unrecognised_answer_denies(approver_factory):
+    from agent.permissions import Decision, Risk
+
+    assert approver_factory("maybe")(request_for(Risk.MODIFIES)) is Decision.NO
+
+
+# -- the spinner tells you what it is doing ---------------------------------
+
+
+def test_the_spinner_names_the_program_being_run():
+    from agent.ui import _running_label
+
+    assert _running_label("run_shell", "$ pytest -q") == "running pytest"
+
+
+def test_the_spinner_names_the_file_operation():
+    from agent.ui import _running_label
+
+    assert _running_label("write_file", "a.py   (3 lines)") == "writing"
+    assert _running_label("search", "TODO") == "searching"
+
+
+def test_an_unknown_tool_still_gets_a_label():
+    from agent.ui import _running_label
+
+    assert _running_label("mystery", "") == "running mystery"
+
+
+def test_the_spinner_counts_elapsed_seconds(console):
+    import time as _time
+
+    renderer = Renderer(console)
+    renderer._label = "thinking"
+    renderer._started = _time.monotonic() - 30
+    text = renderer._status_text()
+    assert "30s" in text
+    assert "ctrl-c" in text, "a long wait should say how to get out of it"
+
+
+def test_a_fast_step_does_not_show_a_stopwatch(console):
+    import time as _time
+
+    renderer = Renderer(console)
+    renderer._label = "thinking"
+    renderer._started = _time.monotonic()
+    assert "0s" not in renderer._status_text()
+
+
+# -- switching provider and model -------------------------------------------
+
+
+def test_model_picker_offers_what_the_provider_serves(session, monkeypatch):
+    seen = {}
+
+    def fake_choose(_console, _title, choices, **kwargs):
+        seen["labels"] = [c.label for c in choices]
+        seen["selected"] = kwargs.get("selected")
+        return "llama-3.1-8b-instant"
+
+    monkeypatch.setattr("agent.repl.interactive", lambda: True)
+    monkeypatch.setattr("agent.repl.choose", fake_choose)
+    monkeypatch.setattr(
+        "agent.repl.list_models", lambda *_a: (["llama-3.1-8b-instant", "other"], None)
+    )
+    session.provider = "groq"
+    session.model = "llama-3.3-70b-versatile"
+    session.handle_command("/model")
+
+    assert session.model == "llama-3.1-8b-instant"
+    assert seen["selected"] == "llama-3.3-70b-versatile", "cursor starts on the one in use"
+    assert "llama-3.1-8b-instant" in seen["labels"]
+
+
+def test_cancelling_the_model_picker_keeps_the_current_model(session, monkeypatch):
+    monkeypatch.setattr("agent.repl.interactive", lambda: True)
+    monkeypatch.setattr("agent.repl.choose", lambda *a, **k: None)
+    monkeypatch.setattr("agent.repl.list_models", lambda *_a: (["a", "b"], None))
+    session.model = "keep-me"
+    session.handle_command("/model")
+    assert session.model == "keep-me"
+
+
+def test_model_picker_says_so_when_the_list_could_not_be_fetched(session, monkeypatch):
+    monkeypatch.setattr("agent.repl.interactive", lambda: True)
+    monkeypatch.setattr("agent.repl.choose", lambda *a, **k: None)
+    monkeypatch.setattr("agent.repl.list_models", lambda *_a: (["a"], "offline"))
+    session.handle_command("/model")
+    assert "could not reach the model list" in output(session.console)
+
+
+def test_switching_provider_moves_to_that_provider_s_default_model(session, monkeypatch):
+    """A groq model id sent to gemini is a 404 -- the model has to move too."""
+    from agent.auth import PROVIDERS
+
+    monkeypatch.setattr("agent.repl.resolve_key", lambda _p: ("key", "saved login"))
+    monkeypatch.setattr("agent.repl.make_client", lambda **_k: object())
+    session.provider, session.model = "groq", "llama-3.3-70b-versatile"
+    session.handle_command("/provider gemini")
+
+    assert session.provider == "gemini"
+    assert session.model == PROVIDERS["gemini"].default_model
+
+
+def test_switching_to_a_provider_with_no_key_changes_nothing(session, monkeypatch):
+    monkeypatch.setattr("agent.repl.resolve_key", lambda _p: (None, "not set"))
+    session.provider, session.model = "groq", "llama-3.3-70b-versatile"
+    session.handle_command("/provider openai")
+
+    assert (session.provider, session.model) == ("groq", "llama-3.3-70b-versatile")
+    assert "/login openai" in output(session.console)
+
+
+def test_provider_picker_marks_the_ones_without_a_key(session, monkeypatch):
+    hints = {}
+
+    def fake_choose(_console, _title, choices, **_kwargs):
+        hints.update({c.value: c.hint for c in choices})
+        return None
+
+    monkeypatch.setattr("agent.repl.choose", fake_choose)
+    monkeypatch.setattr("agent.repl.resolve_key", lambda p: (("key", "x") if p == "groq" else (None, "not set")))
+    session.handle_command("/provider")
+
+    assert "no key" not in hints["groq"]
+    assert "no key" in hints["gemini"]
+
+
+def test_switching_provider_reshapes_the_tool_schemas(session, monkeypatch):
+    """Gemini rejects the union types Groq requires, so they move with the provider."""
+    from agent.tools import tools_for
+
+    monkeypatch.setattr("agent.repl.resolve_key", lambda _p: ("key", "saved login"))
+    monkeypatch.setattr("agent.repl.make_client", lambda **_k: object())
+    session.provider = "groq"
+    session.extras = {"tools": tools_for("groq")}
+    session.handle_command("/provider gemini")
+
+    types = [
+        schema["type"]
+        for tool in session.extras["tools"]
+        for schema in tool["function"]["parameters"]["properties"].values()
+    ]
+    assert not any(isinstance(t, list) for t in types)
+
+
+def test_switching_provider_keeps_the_subagent_tool(session, monkeypatch):
+    """Narrowing must not quietly drop tools the loop was started with."""
+    from agent.subagent import SPAWN_TOOL
+    from agent.tools import tools_for
+
+    monkeypatch.setattr("agent.repl.resolve_key", lambda _p: ("key", "saved login"))
+    monkeypatch.setattr("agent.repl.make_client", lambda **_k: object())
+    session.provider = "groq"
+    session.extras = {"tools": [*tools_for("groq"), SPAWN_TOOL]}
+    session.handle_command("/provider gemini")
+
+    names = [t["function"]["name"] for t in session.extras["tools"]]
+    assert "spawn_subagent" in names
+    assert len(names) == len(set(names)), "a tool was added twice"

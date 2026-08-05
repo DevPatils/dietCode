@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
+import time
 from typing import Any
 
 from rich import box as rich_box
@@ -129,6 +131,26 @@ def describe_tool_call(name: str, arguments: Any) -> tuple[str, str]:
     return name, json.dumps(args, default=str)[:200]
 
 
+def _running_label(name: str, detail: str) -> str:
+    """What to show on the spinner while a tool runs.
+
+    A bare "running" tells you nothing about whether to wait or reach for
+    ctrl-c; naming the command -- and for the shell, the program itself -- does.
+    """
+    if name == "run_shell":
+        command = detail.removeprefix("$ ").split("   (timeout")[0].strip()
+        first = command.split()[0] if command.split() else "command"
+        return f"running {first}"
+    return {
+        "read_file": "reading",
+        "write_file": "writing",
+        "edit_file": "editing",
+        "find_files": "listing files",
+        "search": "searching",
+        "spawn_subagent": "delegating to a subagent",
+    }.get(name, f"running {name}")
+
+
 def humanize_error(message: str) -> tuple[str, str]:
     """Turn an API error into a headline and a next step.
 
@@ -190,20 +212,56 @@ class Renderer:
         self.show_steps = show_steps
         self._status: Any = None
         self._streaming = False
+        self._label = ""
+        self._started = 0.0
+        self._timer: Any = None
 
     # -- spinner ------------------------------------------------------------
 
     def _stop_status(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
         if self._status is not None:
             self._status.stop()
             self._status = None
 
     def _start_status(self, label: str) -> None:
         self._stop_status()
+        self._label = label
+        self._started = time.monotonic()
         self._status = self.console.status(
-            f"[{DETAIL}]{label}[/{DETAIL}]", spinner="dots", spinner_style=MARKER
+            self._status_text(), spinner="dots", spinner_style=MARKER
         )
         self._status.start()
+        self._tick_timer()
+
+    def _status_text(self) -> str:
+        elapsed = time.monotonic() - self._started
+        clock = f" [{MUTED}]{elapsed:.0f}s[/{MUTED}]" if elapsed >= 2 else ""
+        hint = f" [{MUTED}](ctrl-c to interrupt)[/{MUTED}]" if elapsed >= 12 else ""
+        return f"[{DETAIL}]{self._label}[/{DETAIL}]{clock}{hint}"
+
+    def _tick_timer(self) -> None:
+        """Refresh the elapsed counter once a second.
+
+        A frozen 'running' after twenty seconds is indistinguishable from a
+        hang; a ticking one is obviously still working.
+        """
+        if self._status is None:
+            return
+        self._timer = threading.Timer(1.0, self._tick)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _tick(self) -> None:
+        if self._status is None:
+            return
+        try:
+            self._status.update(self._status_text())
+        except Exception:  # noqa: BLE001 - a repaint failure must not kill a run
+            return
+        self._tick_timer()
 
     def close(self) -> None:
         self._end_stream()
@@ -242,7 +300,9 @@ class Renderer:
                 f"[{MUTED}]{dash} step {payload['step']}/{payload['max_steps']} "
                 f"{dash}[/{MUTED}]"
             )
-        self._start_status("thinking")
+        # The step counter belongs on the spinner even when --steps is off: it
+        # is the only signal of how much budget a long task has left.
+        self._start_status(f"thinking [{MUTED}]step {payload['step']}/{payload['max_steps']}[/{MUTED}]")
 
     def _on_assistant_text(self, payload: dict[str, Any]) -> None:
         self._stop_status()
@@ -267,7 +327,7 @@ class Renderer:
             f"[{MARKER}]{marker}[/{MARKER}] [{TOOL}]{label}[/{TOOL}]  "
             f"[{DETAIL}]{detail}[/{DETAIL}]"
         )
-        self._start_status("running")
+        self._start_status(_running_label(payload["name"], detail))
 
     def _on_tool_result(self, payload: dict[str, Any]) -> None:
         self._stop_status()
@@ -616,6 +676,30 @@ def _side_by_side(left: list[Text], right: list[Text], console_width: int) -> Ta
     return grid
 
 
+def _read_answer() -> str:
+    """Read the y/a/n answer so the user can see what they typed.
+
+    input() writes straight to the terminal while rich may still be repainting
+    a spinner over the same line, so the keystrokes vanish and you end up
+    answering blind. prompt_toolkit owns the line and redraws around anything
+    else on screen.
+    """
+    try:
+        if sys.stdin.isatty():
+            from prompt_toolkit import prompt as pt_prompt
+            from prompt_toolkit.formatted_text import ANSI
+
+            return pt_prompt(ANSI("  \x1b[1;91m>\x1b[0m ")).strip().lower()
+        return input("  > ").strip().lower()
+    except ImportError:
+        try:
+            return input("  > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return "n"
+    except (EOFError, KeyboardInterrupt):
+        return "n"
+
+
 def make_approver(console: Console, renderer: Renderer | None = None):
     """Build the approval prompt for host mode.
 
@@ -648,23 +732,27 @@ def make_approver(console: Console, renderer: Renderer | None = None):
         if request.risk is Risk.DANGEROUS:
             console.print(f"  [{WARN}]this is a destructive operation[/{WARN}]")
 
+        # Enter means yes for ordinary work, because approving every read is
+        # most of what this prompt does. It does not for anything destructive
+        # or outside the working directory: a reflex keypress should not be
+        # able to delete a tree.
+        safe_default = request.risk is not Risk.DANGEROUS and not request.outside_root
         key = request.remember_key.split(":", 1)[1]
+        enter = "enter" if safe_default else "y"
         console.print(
-            f"  [{MUTED}][[/{MUTED}][{OK}]y[/{OK}][{MUTED}]] yes  "
+            f"  [{MUTED}][[/{MUTED}][{OK}]{enter}[/{OK}][{MUTED}]] yes  "
             f"[[/{MUTED}][{TOOL}]a[/{TOOL}][{MUTED}]] always allow "
             f"{key}  [[/{MUTED}][{WARN}]n[/{WARN}][{MUTED}]] no[/{MUTED}]"
         )
 
-        try:
-            answer = input("  > ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            console.print(f"  [{WARN}]denied[/{WARN}]")
-            return Decision.NO
-
+        answer = _read_answer()
         if answer in ("a", "always"):
+            console.print(f"  [{OK}]always allowing {key}[/{OK}]\n")
             return Decision.ALWAYS
-        if answer in ("y", "yes"):
+        if answer in ("y", "yes") or (answer == "" and safe_default):
+            console.print(f"  [{OK}]allowed[/{OK}]\n")
             return Decision.ONCE
+        console.print(f"  [{WARN}]denied[/{WARN}]\n")
         return Decision.NO
 
     return ask

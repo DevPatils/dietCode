@@ -29,7 +29,10 @@ from .loop import (
     estimate_tokens,
     make_client,
 )
+from .models import list_models, rank_models
+from .prompts import Choice, choose, interactive
 from .sandbox import SandboxError
+from .tools import TOOL_NAMES, tools_for
 from .ui import (
     BRAND,
     MUTED,
@@ -83,17 +86,18 @@ def _read_input(
     if sys.stdin.isatty():
         try:
             from prompt_toolkit import PromptSession
-            from prompt_toolkit.completion import WordCompleter
             from prompt_toolkit.formatted_text import ANSI
             from prompt_toolkit.history import InMemoryHistory
             from prompt_toolkit.styles import Style
+
+            from .completion import SlashCompleter
 
             if not hasattr(_read_input, "_session"):
                 # Only slash commands complete: every candidate starts with "/",
                 # so ordinary prose never triggers a suggestion popup.
                 _read_input._session = PromptSession(  # type: ignore[attr-defined]
                     history=InMemoryHistory(),
-                    completer=WordCompleter(list(COMMANDS), WORD=True),
+                    completer=SlashCompleter(COMMANDS),
                     # prompt_toolkit styles the bottom toolbar `reverse` by
                     # default, which paints a solid bar across the terminal and
                     # swallows the colours in the text. The status line supplies
@@ -135,6 +139,7 @@ class Session:
         max_total_tokens: int | None = None,
         provider: str | None = None,
         extras: dict[str, Any] | None = None,
+        renderer: Renderer | None = None,
     ):
         self.context_budget = context_budget
         self.max_total_tokens = max_total_tokens
@@ -150,7 +155,7 @@ class Session:
         self.local = local
         self.stream = stream
         self.console = Console()
-        self.renderer = Renderer(self.console, show_steps=show_steps)
+        self.renderer = renderer or Renderer(self.console, show_steps=show_steps)
         self.history: list[dict[str, Any]] | None = None
         self.total_tokens = 0
         self.total_steps = 0
@@ -259,6 +264,16 @@ class Session:
             )
             return False
         self.client = make_client(api_key=api_key, base_url=spec.base_url)
+        # The tool schemas are provider-specific: what Groq needs, Gemini
+        # rejects. Switching provider mid-session has to re-narrow them, or the
+        # next turn 400s on a schema built for the provider we just left.
+        if "tools" in self.extras:
+            extra = [
+                t
+                for t in self.extras["tools"]
+                if t.get("function", {}).get("name") not in TOOL_NAMES
+            ]
+            self.extras["tools"] = [*tools_for(self.provider), *extra]
         return True
 
     def _cmd_login(self, args: list[str]) -> None:
@@ -289,12 +304,26 @@ class Session:
 
     def _cmd_provider(self, args: list[str]) -> None:
         if not args:
-            names = ", ".join(PROVIDERS)
-            self.console.print(
-                f"[{MUTED}]currently {self.provider} {glyph('dot')} "
-                f"available: {names}[/{MUTED}]\n"
+            chosen = choose(
+                self.console,
+                "Which provider?",
+                [
+                    Choice(
+                        spec.name,
+                        spec.label,
+                        # Say which ones are ready to use: switching to a
+                        # provider with no key just bounces you back.
+                        f"{spec.default_model}"
+                        + ("" if resolve_key(spec.name)[0] else f"  {glyph('dash')} no key"),
+                    )
+                    for spec in PROVIDERS.values()
+                ],
+                selected=self.provider,
             )
-            return
+            if chosen is None:
+                self.console.print()
+                return
+            args = [chosen]
         try:
             spec = get_provider(args[0])
         except AuthError as exc:
@@ -314,9 +343,50 @@ class Session:
 
     def _cmd_model(self, args: list[str]) -> None:
         if not args:
-            self.console.print(f"[{MUTED}]currently {self.model}[/{MUTED}]\n")
+            self._pick_model()
             return
         self.model = args[0]
+        self.console.print(f"[{NOTE}]model set to {self.model}[/{NOTE}]\n")
+
+    def _pick_model(self) -> None:
+        """Choose from what this provider actually serves.
+
+        Typing a model id blind is how you find out about a 404 three seconds
+        into a run; the list comes from the provider, so anything on it works.
+        """
+        spec = get_provider(self.provider)
+        self.console.print(f"[{MUTED}]currently {self.model}[/{MUTED}]")
+        if not interactive():
+            return
+        self.console.print(
+            f"[{MUTED}]asking {spec.label} what else it offers"
+            f"{glyph('ellipsis')}[/{MUTED}]"
+        )
+        available, error = list_models(self.client, self.provider)
+        if error:
+            self.console.print(
+                f"[{WARN}]could not reach the model list[/{WARN}] "
+                f"[{MUTED}]{glyph('dash')} showing known-good ids[/{MUTED}]"
+            )
+
+        ranked = rank_models(available, spec.default_model)
+        chosen = choose(
+            self.console,
+            f"{spec.label} model",
+            [
+                Choice(
+                    name,
+                    name,
+                    "recommended" if name == spec.default_model else "",
+                )
+                for name in ranked
+            ],
+            selected=self.model,
+        )
+        if chosen is None:
+            self.console.print()
+            return
+        self.model = chosen
         self.console.print(f"[{NOTE}]model set to {self.model}[/{NOTE}]\n")
 
     def handle_command(self, text: str) -> bool:

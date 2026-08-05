@@ -35,6 +35,7 @@ from .loop import (
     with_project_context,
 )
 from .permissions import PermissionGate, Policy, deny_all
+from .prompts import confirm
 from .repl import Session
 from .sandbox import (
     DEFAULT_CPUS,
@@ -46,7 +47,7 @@ from .sandbox import (
     SandboxError,
 )
 from .subagent import SPAWN_TOOL, make_spawn_handler
-from .tools import TOOLS
+from .tools import tools_for
 from .ui import FAIL, Renderer, make_approver, turn_footer, use_utf8_stdout
 
 SUBCOMMANDS = {"login", "logout", "auth", "doctor"}
@@ -195,7 +196,9 @@ def wants_sandbox(args: argparse.Namespace) -> bool:
     return bool(args.sandbox or args.container or args.mount or args.no_network)
 
 
-def make_executor(args: argparse.Namespace, console: Console) -> tuple[Any, list]:
+def make_executor(
+    args: argparse.Namespace, console: Console, renderer: Renderer | None = None
+) -> tuple[Any, list]:
     if not wants_sandbox(args):
         root = Path(args.workdir).resolve()
         inner = LocalExecutor(root)
@@ -209,7 +212,7 @@ def make_executor(args: argparse.Namespace, console: Console) -> tuple[Any, list
             approver = deny_all  # unreachable while yes_to_everything is set
         elif sys.stdin.isatty():
             policy = Policy()
-            approver = make_approver(console)
+            approver = make_approver(console, renderer)
         else:
             # Nothing can be asked, so nothing destructive may happen. Silently
             # approving here is how an automated run rewrites someone's files.
@@ -246,6 +249,10 @@ def build_agent_extras(
     """The optional bits: project instructions and sub-agent delegation."""
     extras: dict[str, Any] = {}
 
+    # Always set, because the schemas one provider requires are the ones
+    # another rejects. Whichever provider the user picked has to work.
+    extras["tools"] = tools_for(getattr(args, "provider", None) or default_provider())
+
     if getattr(args, "context", True):
         context, source = load_project_context(
                 "." if wants_sandbox(args) else args.workdir
@@ -255,7 +262,7 @@ def build_agent_extras(
             console.print(f"[dim]using project instructions from {source}[/dim]")
 
     if getattr(args, "subagents", False):
-        extras["tools"] = [*TOOLS, SPAWN_TOOL]
+        extras["tools"] = [*extras["tools"], SPAWN_TOOL]
         extras["extra_tool_handlers"] = {
             "spawn_subagent": make_spawn_handler(
                 executor, client, model, context_budget=args.context_budget
@@ -264,9 +271,14 @@ def build_agent_extras(
     return extras
 
 
-def run_once(args: argparse.Namespace, executor: Any, client: Any, model: str) -> int:
-    console = Console(quiet=args.quiet and not args.json)
-    renderer = Renderer(console, show_steps=args.steps)
+def run_once(
+    args: argparse.Namespace,
+    executor: Any,
+    client: Any,
+    model: str,
+    console: Console,
+    renderer: Renderer,
+) -> int:
     started = time.monotonic()
     try:
         result = agent_loop(
@@ -333,9 +345,12 @@ def main(argv: list[str] | None = None) -> int:
     # .env is a convenience for running from a checkout; installed users have a
     # saved login instead. Optional so the package does not hard-depend on it.
     try:
-        from dotenv import load_dotenv
+        from dotenv import find_dotenv, load_dotenv
 
-        load_dotenv()
+        # usecwd, because the default searches upward from *this file*. Inside
+        # a pipx install that is site-packages, so an installed dietcode never
+        # saw the .env sitting in the directory the user was standing in.
+        load_dotenv(find_dotenv(usecwd=True))
     except ImportError:
         pass
 
@@ -356,8 +371,27 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         api_key, base_url, model = resolve_model_config(args)
+    except AuthError as exc:
+        # Dead-ending on "no credentials" makes the user go read the help, come
+        # back, and run a different command. Offer to fix it right here instead.
+        if not sys.stdin.isatty():
+            console.print(f"[red]{exc}[/red]")
+            return 2
+        console.print(f"[orange3]{exc}[/orange3]\n")
+        if not confirm(console, "Set one up now?"):
+            return 2
+        if login(console, args.provider, None) != 0:
+            return 2
+        try:
+            api_key, base_url, model = resolve_model_config(args)
+        except AuthError as retry_exc:
+            console.print(f"[red]{retry_exc}[/red]")
+            return 2
+        console.print()
+
+    try:
         client = make_client(api_key=api_key, base_url=base_url)
-    except (AuthError, RuntimeError) as exc:
+    except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         return 2
 
@@ -368,8 +402,9 @@ def main(argv: list[str] | None = None) -> int:
         if stale:
             console.print(f"[dim]cleaned up {stale} orphaned container(s)[/dim]")
 
+    renderer = Renderer(console, show_steps=args.steps)
     try:
-        executor, mounts = make_executor(args, console)
+        executor, mounts = make_executor(args, console, renderer)
     except SandboxError as exc:
         # Docker is optional now that --here exists, so a missing daemon should
         # be a signpost rather than a dead end.
@@ -385,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.task:
-            return run_once(args, executor, client, model)
+            return run_once(args, executor, client, model, console, renderer)
         return Session(
             executor,
             client,
@@ -399,6 +434,7 @@ def main(argv: list[str] | None = None) -> int:
             max_total_tokens=args.max_tokens,
             provider=args.provider or default_provider(),
             extras=build_agent_extras(args, executor, client, model, console),
+            renderer=renderer,
         ).run()
     finally:
         executor.close()
