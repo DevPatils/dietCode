@@ -445,16 +445,20 @@ def _strip_ansi(text: str) -> str:
 
 
 def sandbox_label(container: str | None, mounts: list[tuple[str, str]], local: bool) -> str:
-    """Isolation state, in the colour it deserves."""
+    """How protected this session is, stated rather than alarmed about.
+
+    Working in your own directory is the default, so it reports the protection
+    that is actually in place -- the gate asks before every change. A red
+    warning on every launch is one you stop reading.
+    """
     esc = "\x1b["
-    red, orange, green, reset = (
-        f"{esc}38;5;203m",
+    orange, green, reset = (
         f"{esc}38;5;208m",
         f"{esc}38;5;114m",
         f"{esc}0m",
     )
     if local:
-        return f"{red}no sandbox{reset}"
+        return f"{green}asks first{reset}"
     if mounts:
         return f"{green}sandboxed{reset} {orange}+ mounted{reset}"
     return f"{green}sandboxed{reset}"

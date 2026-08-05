@@ -86,6 +86,7 @@ def _read_input(
             from prompt_toolkit.completion import WordCompleter
             from prompt_toolkit.formatted_text import ANSI
             from prompt_toolkit.history import InMemoryHistory
+            from prompt_toolkit.styles import Style
 
             if not hasattr(_read_input, "_session"):
                 # Only slash commands complete: every candidate starts with "/",
@@ -93,6 +94,16 @@ def _read_input(
                 _read_input._session = PromptSession(  # type: ignore[attr-defined]
                     history=InMemoryHistory(),
                     completer=WordCompleter(list(COMMANDS), WORD=True),
+                    # prompt_toolkit styles the bottom toolbar `reverse` by
+                    # default, which paints a solid bar across the terminal and
+                    # swallows the colours in the text. The status line supplies
+                    # its own, so clear the background entirely.
+                    style=Style.from_dict(
+                        {
+                            "bottom-toolbar": "noreverse bg:default fg:default",
+                            "bottom-toolbar.text": "noreverse bg:default",
+                        }
+                    ),
                 )
             # prompt_toolkit renders these itself, so they are raw escapes
             # rather than rich markup.

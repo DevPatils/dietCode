@@ -330,11 +330,22 @@ def test_status_bar_shows_location_sandbox_and_model():
     assert "(73%)" in bar
 
 
-def test_unsandboxed_is_called_out_in_the_status_bar():
-    """The one state a user must never miss."""
+def test_the_status_bar_reports_the_protection_not_an_alarm():
+    """Working in your own directory is the default now, so the bar states what
+    is protecting you. A red warning on every single launch is one people stop
+    reading, which is worse than no warning."""
     from agent.ui import sandbox_label
 
-    assert "no sandbox" in sandbox_label(None, [], local=True)
+    label = sandbox_label(None, [], local=True)
+    assert "asks first" in label
+    assert "no sandbox" not in label
+
+
+def test_a_mounted_sandbox_is_distinguishable_from_a_sealed_one():
+    from agent.ui import sandbox_label
+
+    assert "mounted" in sandbox_label("c", [("/host", "/workspace")], local=False)
+    assert "mounted" not in sandbox_label("c", [], local=False)
 
 
 def test_status_bar_survives_a_narrow_terminal():
