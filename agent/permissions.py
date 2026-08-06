@@ -150,6 +150,29 @@ def classify(command: str) -> tuple[Risk, str]:
     return Risk.MODIFIES, "can change files"
 
 
+class Mode(StrEnum):
+    """How much the agent may do before it has to stop and ask.
+
+    A mode rather than a per-call setting, because the answer to "may I write
+    this file" is almost never about the individual file -- it is about how
+    much you currently trust the run. Snapshots are what make the looser two
+    reasonable: every edit is recoverable with /undo.
+    """
+
+    MANUAL = "manual"            # ask before anything that changes state
+    ACCEPT_EDITS = "accept-edits"  # file writes go through; commands still ask
+    PLAN = "plan"                # nothing executes; the turn produces a plan
+    AUTO = "auto"                # ask for nothing
+
+
+MODE_HELP = {
+    Mode.MANUAL: "ask before every command and every write",
+    Mode.ACCEPT_EDITS: "write files freely, still ask before running commands",
+    Mode.PLAN: "read and think, but change nothing",
+    Mode.AUTO: "do everything without asking",
+}
+
+
 @dataclass
 class Policy:
     """What to do without asking."""
@@ -160,6 +183,21 @@ class Policy:
     auto_allow_reads: bool = True
     # Approve everything, no prompts. Named to be hard to type by accident.
     yes_to_everything: bool = False
+    mode: Mode = Mode.MANUAL
+
+    @classmethod
+    def for_mode(cls, mode: Mode | str) -> Policy:
+        mode = Mode(mode)
+        return cls(yes_to_everything=mode is Mode.AUTO, mode=mode)
+
+    @property
+    def writes_need_approval(self) -> bool:
+        return self.mode is Mode.MANUAL
+
+    @property
+    def read_only(self) -> bool:
+        """Plan mode: nothing may change, however it is asked for."""
+        return self.mode is Mode.PLAN
 
 
 class PermissionGate:
@@ -203,7 +241,22 @@ class PermissionGate:
             return True
 
     def _permitted(self, request: Request) -> bool:
+        if self.policy.read_only and request.risk is not Risk.READ_ONLY:
+            # Plan mode. Refused without asking: the whole point is that this
+            # turn cannot change anything, so a prompt would be theatre.
+            self.denied_count += 1
+            return False
         if self.policy.yes_to_everything:
+            return True
+        if (
+            request.action == "write"
+            and not request.outside_root
+            and not self.policy.writes_need_approval
+        ):
+            # accept-edits: writes inside the working directory go through,
+            # because snapshots make them recoverable. Outside it they do not
+            # -- nothing about this mode says "edit the rest of the disk".
+            self.approved.append(request)
             return True
         if request.remember_key in self._remembered:
             return True
@@ -234,7 +287,10 @@ class PermissionGate:
             return ShellResult(
                 stdout="",
                 stderr=(
-                    "Denied by the user. Do not retry this command; either "
+                    "Plan mode: nothing may be run or changed. Describe what you "
+                    "would do instead, then stop."
+                    if self.policy.read_only
+                    else "Denied by the user. Do not retry this command; either "
                     "explain why it is needed or try a different approach."
                 ),
                 exit_code=DENIED_EXIT_CODE,
@@ -291,7 +347,12 @@ class PermissionGate:
             root=str(self.root),
         )
         if not self._permitted(request):
-            raise SandboxError(f"writing {path} was denied by the user")
+            raise SandboxError(
+                f"Plan mode: {path} was not written. Nothing may be changed this "
+                f"turn -- describe the change instead."
+                if self.policy.read_only
+                else f"writing {path} was denied by the user"
+            )
         self._inner.write_file(path, content)
 
     def close(self) -> None:

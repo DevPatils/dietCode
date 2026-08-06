@@ -34,6 +34,11 @@ REQUEST_TIMEOUT = float(os.environ.get("AGENT_REQUEST_TIMEOUT", "120"))
 # tokens spent. Four attempts with a longer backoff rides those out.
 MAX_LLM_RETRIES = 4
 
+# How many times a failing verify command may send the model back to work.
+# Bounded for the same reason the deferral cap is: a model that cannot fix
+# the failure must still terminate rather than burn the request quota.
+MAX_VERIFY_ATTEMPTS = 3
+
 # How many times to bounce a task_complete that was batched with the work it
 # claims to have verified. Bounded so a model that always batches still
 # terminates instead of burning the daily request quota.
@@ -74,6 +79,65 @@ You are graded on the final state of the container, not on your explanation."""
 # already have lying around.
 CONTEXT_FILES = ("DIETCODE.md", "AGENTS.md", "CLAUDE.md", ".cursorrules")
 MAX_CONTEXT_CHARS = 8000
+
+
+SCAFFOLD = """\
+# DIETCODE.md
+
+Standing instructions for dietcode in this project. Everything here is prepended
+to the agent's system prompt, every turn, in every session.
+
+dietcode created this file on your first prompt because the project had no
+instructions file. Delete it if you do not want one -- it will not come back
+while any of {others} exists.
+
+## What this project is
+
+<!-- One or two sentences. What it does, and who runs it. -->
+
+## How to run it
+
+```bash
+# the commands you would tell a new colleague: install, test, lint
+```
+
+## Things that are not obvious
+
+<!-- The traps. Anything where the reasonable-looking change is the wrong one.
+     These are worth more than a description of the directory layout, which the
+     agent can read for itself. -->
+"""
+
+
+def ensure_project_context(root: str | os.PathLike[str] = ".") -> str | None:
+    """Create DIETCODE.md when the project has no instructions file at all.
+
+    Written from the host, like reading them is, and only ever created --
+    never updated. The agent must not be able to edit its own standing orders
+    mid-run, so scaffolding is the CLI's job, before the loop starts, and the
+    file is left alone from then on.
+
+    Returns the filename if one was created, else None.
+    """
+    from pathlib import Path
+
+    base = Path(root)
+    _text, existing = load_project_context(base)
+    if existing is not None:
+        return None
+
+    target = base / CONTEXT_FILES[0]
+    if target.exists():
+        # Present but empty, which load_project_context skips. Leave it: the
+        # user made it, and overwriting someone's file is never ours to do.
+        return None
+
+    try:
+        others = ", ".join(CONTEXT_FILES[1:])
+        target.write_text(SCAFFOLD.format(others=others), encoding="utf-8")
+    except OSError:
+        return None
+    return target.name
 
 
 def load_project_context(root: str | os.PathLike[str] = ".") -> tuple[str, str | None]:
@@ -587,6 +651,8 @@ def agent_loop(
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     system_prompt: str = SYSTEM_PROMPT,
     tools: Sequence[dict[str, Any]] = TOOLS,
+    verify_command: str | None = None,
+    verify_timeout: int = 300,
     stream: bool = False,
     context_budget: int = DEFAULT_CONTEXT_BUDGET,
     max_total_tokens: int | None = None,
@@ -623,6 +689,7 @@ def agent_loop(
     tool_errors = 0
     recovered_tool_calls = 0
     deferrals = 0
+    verifications = 0
     last_summary = ""
 
     def emit(event: str, **payload: Any) -> None:
@@ -788,6 +855,32 @@ def agent_loop(
             # If task_complete arrived alone, the model has already seen the
             # results it is judging and we take it at its word.
             if len(calls) == 1 or deferrals >= MAX_COMPLETION_DEFERRALS:
+                # The model saying it is done is an opinion. A command that has
+                # to pass first is a fact -- so when one is configured, it is
+                # what decides whether the loop ends.
+                if verify_command and verifications < MAX_VERIFY_ATTEMPTS:
+                    emit("verifying", step=step, command=verify_command)
+                    check = executor.run_shell(verify_command, timeout=verify_timeout)
+                    if check.exit_code != 0:
+                        verifications += 1
+                        last_summary = summary
+                        output = (check.stdout + "\n" + check.stderr).strip()
+                        for msg in tool_messages:
+                            if msg["tool_call_id"] == call["id"]:
+                                msg["content"] = (
+                                    f"Not done: `{verify_command}` still fails "
+                                    f"(exit {check.exit_code}).\n\n{output[-2000:]}\n\n"
+                                    f"Fix the cause, then call task_complete again."
+                                )
+                        emit(
+                            "verification_failed",
+                            step=step,
+                            command=verify_command,
+                            exit_code=check.exit_code,
+                        )
+                        continue
+                    emit("verified", step=step, command=verify_command)
+
                 emit("complete", step=step, summary=summary)
                 return result("complete", summary, step)
 

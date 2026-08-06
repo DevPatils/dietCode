@@ -1,6 +1,8 @@
-# CLAUDE.md
+# DIETCODE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Standing instructions for any coding agent working in this repository -- dietcode
+reads this file first, and Claude Code reads it too. `CLAUDE.md` is deliberately
+absent: this project's own convention is DIETCODE.md, so it dogfoods it.
 
 ## What this is
 
@@ -228,13 +230,78 @@ These encode failures already hit; changing them will silently break runs.
 - **Never run the full 89-task suite while iterating** — fixed ~15–20 task subset.
 - Full-file overwrite is fine for `write_file`; no diff-based editing, no UI beyond CLI.
 
-## Not built yet
+## The session architecture
 
-`spawn_subagent` (stretch goal) — a fresh `agent_loop` with isolated message history that
-returns *only* its final summary to the parent; the context isolation is the mechanism
-being tested, so sharing history defeats it. `agent_loop` already takes an
-`extra_tool_handlers` hook for this and the hook is tested. It is deliberately left until
-a baseline benchmark score exists to compare against.
+Sketched 2026-08-06, built the same day. The shape:
+
+```
+prompt ──> session ──> context assembly ──> MODEL ──> pick a tool
+             │              ▲                              │
+             │              └──────────────────────────────┤
+             ▼                                             ▼
+      JSONL transcript                             execution gate
+   (forkable, resumable)                    manual │ accept-edits │ plan │ auto
+                                                   │
+                                          snapshot before edit
+                                                   │
+                                       verify command passes ──> output
+```
+
+**The session is the unit of state, not the process** (`agent/sessions.py`). A prompt
+opens a session; the session is a JSONL transcript under
+`~/.dietcode/projects/<slug>/`. Resume is a read (`--resume`, `--continue`), fork is a
+copy of a prefix (`--fork`, `/fork`) — both fall out of the transcript being a file, and
+neither needed its own mechanism. One-shot runs persist too, so
+`dietcode "do a thing"` then `dietcode --continue` works.
+
+Not in the project directory, for the reason credentials are not: a transcript carries
+every file the agent read and every line of shell output. A directory in the repo is a
+directory that gets committed.
+
+**Append-only, one message per line.** A single JSON document rewritten each turn loses
+the whole conversation to one interrupted write; with JSONL a killed session is readable
+up to its last complete line, and `load_messages` skips a torn tail. Only the new tail
+is appended each turn — the loop hands back the entire conversation every time, so
+re-writing all of it would grow the file quadratically. **A resumed session must set
+`_written` to what is already on disk**, or turn two writes the whole history a second
+time.
+
+**Instructions the user owns, memory the agent owns.** `DIETCODE.md` is scaffolded on
+the *first prompt* of a project that has no instructions file — from the host, before
+the loop, never through the `Executor`, and only ever created. The agent still cannot
+rewrite its own standing orders mid-run. What it can write is `memory/memory.md`
+(`agent/memory.py`, the `remember` tool), kept beside the transcripts and folded into
+the system prompt marked as *its own notes, not the user's instructions*. That split is
+what makes "the agent creates a file for what it learns" safe.
+
+Scaffolding is on the first prompt rather than at launch on purpose: opening dietcode to
+ask a question should leave nothing behind in someone's repo.
+
+**Execution gates are a mode, not a question per call** (`permissions.Mode`): `manual`,
+`accept-edits`, `plan`, `auto`, via `--mode` or `/mode`. The answer to "may I write this
+file" is almost never about the file — it is about how much you trust this run.
+`accept-edits` lets writes *inside the working directory* through and still asks before
+commands; outside it, it asks, because nothing about the mode says "edit the rest of the
+disk". `plan` refuses without prompting — a prompt you are not allowed to say yes to is
+theatre — and tells the model it is planning, so it describes the change instead of
+retrying.
+
+**A snapshot is taken before every file change** (`agent/snapshots.py`), which is what
+makes the looser modes survivable: `/undo` and `/undo all` put files back. Implemented
+as an `Executor` wrapper **inside** the gate, so an approved write is snapshotted and a
+denied one is not, and taking the copy never triggers a read prompt. Shell commands are
+deliberately not snapshotted — guessing which paths a command will write is worse than
+being honest that undo covers file tools only.
+
+**Restoring must go through the unwrapped executor.** Writing a restore back through the
+snapshotting layer checkpoints the restore itself, so `undo_all` puts a change back for
+every one it takes off and never terminates. That was a real infinite loop, caught by a
+test.
+
+**"Done" is the model's opinion; `--verify` makes it an exit code.** When a verify
+command is configured, `task_complete` does not end the loop until that command exits 0;
+a failure is handed back with its output and the model keeps working. Bounded by
+`MAX_VERIFY_ATTEMPTS` for the same reason the deferral cap exists.
 
 Terminal-Bench grades by inspecting final container state, not the agent transcript — a
 run that looks correct in the log can still fail. Note also that `SessionExecutor`

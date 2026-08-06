@@ -310,3 +310,115 @@ def test_the_gate_is_a_drop_in_executor(gate_factory):
     out = execute_tool("write_file", {"path": "x.txt", "content": "y"}, gate)
     assert out.startswith("Error:")
     assert "denied" in out.lower()
+
+
+# -- gate modes -------------------------------------------------------------
+#
+# A mode rather than a per-call setting: the answer to "may I write this file"
+# is almost never about the file, it is about how much you trust this run.
+
+
+@pytest.fixture
+def mode_gate(tmp_path):
+    """Build a gate in a given mode, recording what it was asked."""
+    from agent.permissions import Mode, PermissionGate, Policy
+    from agent.sandbox import LocalExecutor
+
+    def build(mode):
+        approver = Recorder(Decision.ONCE, Decision.ONCE, Decision.ONCE)
+        gate = PermissionGate(
+            LocalExecutor(tmp_path),
+            root=tmp_path,
+            approver=approver,
+            policy=Policy.for_mode(Mode(mode)),
+        )
+        return gate, approver, tmp_path
+
+    return build
+
+
+def test_manual_asks_before_a_write(mode_gate):
+    gate, approver, _root = mode_gate("manual")
+    gate.write_file("a.py", "x")
+    assert len(approver.seen) == 1
+
+
+def test_accept_edits_lets_writes_through(mode_gate):
+    gate, approver, root = mode_gate("accept-edits")
+    gate.write_file("a.py", "x")
+
+    assert approver.seen == [], "the point of the mode is not being asked"
+    assert (root / "a.py").read_text() == "x"
+
+
+def test_accept_edits_still_asks_before_running_a_command(mode_gate):
+    """Editing a file is recoverable with /undo; running a command is not."""
+    gate, approver, _root = mode_gate("accept-edits")
+    gate.run_shell("rm -rf build")
+    assert len(approver.seen) == 1
+
+
+def test_accept_edits_does_not_extend_outside_the_working_directory(mode_gate, tmp_path):
+    """Nothing about the mode says "edit the rest of the disk"."""
+    gate, approver, _root = mode_gate("accept-edits")
+    outside = tmp_path.parent / "elsewhere.txt"
+    gate.write_file(str(outside), "x")
+    assert len(approver.seen) == 1
+
+
+def test_plan_mode_changes_nothing(mode_gate):
+    from agent.sandbox import SandboxError
+
+    gate, _approver, root = mode_gate("plan")
+    with pytest.raises(SandboxError):
+        gate.write_file("a.py", "x")
+    assert not (root / "a.py").exists()
+
+
+def test_plan_mode_does_not_even_ask(mode_gate):
+    """A prompt you are not allowed to say yes to is theatre."""
+    from agent.sandbox import SandboxError
+
+    gate, approver, _root = mode_gate("plan")
+    with pytest.raises(SandboxError):
+        gate.write_file("a.py", "x")
+    gate.run_shell("touch b")
+    assert approver.seen == []
+
+
+def test_plan_mode_still_reads(mode_gate):
+    gate, _approver, root = mode_gate("plan")
+    (root / "a.py").write_text("contents", encoding="utf-8")
+    assert gate.read_file("a.py") == "contents"
+
+
+def test_plan_mode_still_runs_read_only_commands(mode_gate):
+    gate, _approver, _root = mode_gate("plan")
+    assert gate.run_shell("echo hi").exit_code == 0
+
+
+def test_plan_mode_says_why_it_refused(mode_gate):
+    """The model has to understand it is planning, not being denied at random."""
+    gate, _approver, _root = mode_gate("plan")
+    result = gate.run_shell("touch b")
+    assert "plan mode" in result.stderr.lower()
+
+
+def test_auto_asks_for_nothing(mode_gate):
+    gate, approver, root = mode_gate("auto")
+    gate.write_file("a.py", "x")
+    gate.run_shell("echo hi")
+    assert approver.seen == []
+    assert (root / "a.py").read_text() == "x"
+
+
+def test_yes_to_everything_is_what_auto_sets(mode_gate):
+    gate, _approver, _root = mode_gate("auto")
+    assert gate.policy.yes_to_everything is True
+
+
+def test_every_mode_has_a_description():
+    from agent.permissions import MODE_HELP, Mode
+
+    for mode in Mode:
+        assert MODE_HELP[mode]

@@ -30,12 +30,14 @@ from .loop import (
     DEFAULT_MAX_ITERATIONS,
     SYSTEM_PROMPT,
     agent_loop,
+    ensure_project_context,
     load_project_context,
     make_client,
     with_project_context,
 )
-from .permissions import PermissionGate, Policy, deny_all
-from .prompts import confirm
+from .memory import REMEMBER_TOOL, make_remember_handler, with_memory
+from .permissions import MODE_HELP, Mode, PermissionGate, Policy, deny_all
+from .prompts import Choice, choose, confirm
 from .repl import Session
 from .sandbox import (
     DEFAULT_CPUS,
@@ -46,6 +48,15 @@ from .sandbox import (
     LocalExecutor,
     SandboxError,
 )
+from .sessions import (
+    SessionStore,
+    find_session,
+    fork,
+    latest_session,
+    list_sessions,
+    load_messages,
+)
+from .snapshots import SnapshotStore, Snapshotting
 from .subagent import SPAWN_TOOL, make_spawn_handler
 from .tools import tools_for
 from .ui import FAIL, Renderer, make_approver, turn_footer, use_utf8_stdout
@@ -75,6 +86,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--subagents",
         action="store_true",
         help="let the agent delegate self-contained work to sub-agents",
+    )
+    model.add_argument(
+        "--verify",
+        metavar="CMD",
+        help="a command that must exit 0 before the agent is allowed to finish, "
+        'e.g. --verify "python -m pytest -q"',
+    )
+    model.add_argument(
+        "--no-memory",
+        dest="memory",
+        action="store_false",
+        help="do not load or write the agent's notes for this project",
     )
     model.add_argument(
         "--no-context",
@@ -122,9 +145,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sandbox.add_argument("--workdir", default=".", help="directory to work in")
     sandbox.add_argument(
+        "--mode",
+        choices=[m.value for m in Mode],
+        default=Mode.MANUAL.value,
+        help="how much to do before asking: "
+        + " | ".join(f"{m.value} ({MODE_HELP[m]})" for m in Mode),
+    )
+    sandbox.add_argument(
         "--yes",
         action="store_true",
-        help="approve every action without asking (dangerous)",
+        help="approve every action without asking (same as --mode auto)",
     )
     sandbox.add_argument("--image", default=DEFAULT_IMAGE, help="sandbox container image")
     sandbox.add_argument(
@@ -144,6 +174,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--cleanup",
         action="store_true",
         help="remove every leftover agent container and exit",
+    )
+
+    session = parser.add_argument_group("sessions")
+    session.add_argument(
+        "--resume",
+        nargs="?",
+        const="",
+        metavar="ID",
+        help="carry on a saved session; omit the id to pick from a list",
+    )
+    session.add_argument(
+        "--continue",
+        dest="continue_last",
+        action="store_true",
+        help="carry on the most recent session in this directory",
+    )
+    session.add_argument(
+        "--fork",
+        metavar="ID",
+        help="branch a saved session into a new one and continue there",
+    )
+    session.add_argument(
+        "--no-snapshots",
+        dest="snapshots",
+        action="store_false",
+        help="do not keep a copy of each file before the agent changes it",
+    )
+    session.add_argument(
+        "--no-save",
+        dest="save",
+        action="store_false",
+        help="do not write a transcript for this session",
     )
 
     output = parser.add_argument_group("output")
@@ -197,21 +259,34 @@ def wants_sandbox(args: argparse.Namespace) -> bool:
 
 
 def make_executor(
-    args: argparse.Namespace, console: Console, renderer: Renderer | None = None
+    args: argparse.Namespace,
+    console: Console,
+    renderer: Renderer | None = None,
+    snapshots: SnapshotStore | None = None,
 ) -> tuple[Any, list]:
     if not wants_sandbox(args):
         root = Path(args.workdir).resolve()
-        inner = LocalExecutor(root)
+        inner: Any = LocalExecutor(root)
+        # Inside the gate, not outside it: the gate asks first, and only an
+        # approved write ever reaches the snapshot. Wrapping the other way
+        # round would prompt for a read every time a file was about to change.
+        if snapshots is not None:
+            inner = Snapshotting(inner, snapshots)
 
-        if args.yes:
+        # --yes is the older spelling of --mode auto; keep it working.
+        mode = Mode.AUTO if args.yes else Mode(args.mode)
+
+        if mode is Mode.AUTO:
             console.print(
-                f"[{FAIL}] --yes: every command runs without asking [/{FAIL}] "
+                f"[{FAIL}] auto: every command runs without asking [/{FAIL}] "
                 f"[orange3]{root}[/orange3]"
             )
-            policy = Policy(yes_to_everything=True)
+            policy = Policy.for_mode(mode)
             approver = deny_all  # unreachable while yes_to_everything is set
         elif sys.stdin.isatty():
-            policy = Policy()
+            policy = Policy.for_mode(mode)
+            if mode is not Mode.MANUAL:
+                console.print(f"[dim]{mode.value}: {MODE_HELP[mode]}[/dim]")
             approver = make_approver(console, renderer)
         else:
             # Nothing can be asked, so nothing destructive may happen. Silently
@@ -220,7 +295,7 @@ def make_executor(
                 "[orange3]not a terminal: actions that need approval will be "
                 "denied. Use --yes to override.[/orange3]"
             )
-            policy = Policy()
+            policy = Policy.for_mode(mode)
             approver = deny_all
 
         return PermissionGate(inner, root=root, approver=approver, policy=policy), []
@@ -240,11 +315,107 @@ def make_executor(
         pids_limit=args.pids_limit,
         network="none" if args.no_network else None,
     )
+    if snapshots is not None:
+        return Snapshotting(executor, snapshots), mounts
     return executor, mounts
 
 
+def resolve_session(
+    args: argparse.Namespace, console: Console, model: str
+) -> tuple[Any, list[dict[str, Any]] | None]:
+    """Work out which transcript this session writes to, and what it starts with.
+
+    Returns (store, history). `(None, None)` means the user asked for a session
+    that could not be found -- caller should give up rather than silently open a
+    new one, because "resume" that quietly starts fresh loses work.
+    """
+    project = str(Path(args.workdir).resolve())
+    target: Any = None
+
+    if args.fork:
+        source = find_session(project, args.fork)
+        if source is None:
+            console.print(f"[red]no session matching {args.fork!r} in this directory[/red]")
+            return None, None
+        forked = fork(source)
+        console.print(f"[dim]forked {source.session_id} -> {forked}[/dim]")
+        target = find_session(project, forked)
+    elif args.continue_last:
+        target = latest_session(project)
+        if target is None:
+            console.print("[dim]no earlier session here; starting a new one[/dim]")
+    elif args.resume is not None:
+        if args.resume:
+            target = find_session(project, args.resume)
+            if target is None:
+                console.print(f"[red]no session matching {args.resume!r} in this directory[/red]")
+                return None, None
+        else:
+            target = pick_session(console, project)
+            if target is None:
+                return None, None
+
+    if not args.save:
+        # Still resumable: reading a transcript and appending to it are
+        # separate decisions.
+        history = load_messages(target.path) if target else None
+        return None, history
+
+    if target is not None:
+        store = SessionStore(
+            project=project,
+            session_id=target.session_id,
+            model=model,
+            provider=args.provider or default_provider(),
+        )
+        history = load_messages(target.path)
+        # Already on disk; without this the whole conversation is appended a
+        # second time on the next turn.
+        store._written = len(history)
+        store._wrote_header = True
+        console.print(
+            f"[dim]resumed {target.session_id} {len(history)} messages[/dim]"
+        )
+        return store, history
+
+    return (
+        SessionStore(
+            project=project,
+            model=model,
+            provider=args.provider or default_provider(),
+        ),
+        None,
+    )
+
+
+def pick_session(console: Console, project: str) -> Any:
+    """`--resume` with no id: choose from what is actually there."""
+    rows = list_sessions(project)
+    if not rows:
+        console.print("[dim]no saved sessions in this directory[/dim]")
+        return None
+    chosen = choose(
+        console,
+        "Resume which session?",
+        [
+            Choice(
+                meta.session_id,
+                meta.session_id,
+                f"{meta.turns} turn(s)  {meta.label}",
+            )
+            for meta in rows
+        ],
+    )
+    return next((m for m in rows if m.session_id == chosen), None)
+
+
 def build_agent_extras(
-    args: argparse.Namespace, executor: Any, client: Any, model: str, console: Console
+    args: argparse.Namespace,
+    executor: Any,
+    client: Any,
+    model: str,
+    console: Console,
+    scaffold: bool = False,
 ) -> dict[str, Any]:
     """The optional bits: project instructions and sub-agent delegation."""
     extras: dict[str, Any] = {}
@@ -254,6 +425,15 @@ def build_agent_extras(
     extras["tools"] = tools_for(getattr(args, "provider", None) or default_provider())
 
     if getattr(args, "context", True):
+        # Only for a run that acts on the host project. In sandbox mode the
+        # agent works in a container and the host directory may not even be
+        # the thing being edited.
+        # Interactive sessions scaffold on their first prompt instead, so
+        # that opening dietcode to ask a question leaves nothing behind.
+        if scaffold and not wants_sandbox(args):
+            created = ensure_project_context(args.workdir)
+            if created:
+                console.print(f"[dim]created {created} for this project[/dim]")
         context, source = load_project_context(
                 "." if wants_sandbox(args) else args.workdir
             )
@@ -261,13 +441,31 @@ def build_agent_extras(
             extras["system_prompt"] = with_project_context(SYSTEM_PROMPT, context, source)
             console.print(f"[dim]using project instructions from {source}[/dim]")
 
+    handlers: dict[str, Any] = {}
+
+    if getattr(args, "memory", True):
+        # The agent's own notes, kept apart from the user's instructions: it
+        # may write these, and must not be able to write those.
+        project = str(Path(args.workdir).resolve())
+        extras["system_prompt"] = with_memory(
+            extras.get("system_prompt", SYSTEM_PROMPT), project
+        )
+        extras["tools"] = [*extras["tools"], REMEMBER_TOOL]
+        handlers["remember"] = make_remember_handler(project)
+
     if getattr(args, "subagents", False):
         extras["tools"] = [*extras["tools"], SPAWN_TOOL]
-        extras["extra_tool_handlers"] = {
-            "spawn_subagent": make_spawn_handler(
-                executor, client, model, context_budget=args.context_budget
-            )
-        }
+        handlers["spawn_subagent"] = make_spawn_handler(
+            executor, client, model, context_budget=args.context_budget
+        )
+
+    if getattr(args, "verify", None):
+        # "Done" stops being the model's opinion and becomes this command's
+        # exit code.
+        extras["verify_command"] = args.verify
+
+    if handlers:
+        extras["extra_tool_handlers"] = handlers
     return extras
 
 
@@ -278,6 +476,7 @@ def run_once(
     model: str,
     console: Console,
     renderer: Renderer,
+    store: SessionStore | None = None,
 ) -> int:
     started = time.monotonic()
     try:
@@ -291,7 +490,7 @@ def run_once(
             context_budget=args.context_budget,
             max_total_tokens=args.max_tokens,
             on_event=None if args.quiet else renderer.on_event,
-            **build_agent_extras(args, executor, client, model, console),
+            **build_agent_extras(args, executor, client, model, console, scaffold=True),
         )
     except KeyboardInterrupt:
         renderer.close()
@@ -299,6 +498,17 @@ def run_once(
         return 130
     finally:
         renderer.close()
+
+    # A one-shot run is still a session -- otherwise `dietcode "do a thing"`
+    # followed by `dietcode --continue` has nothing to continue from.
+    if store is not None:
+        store.record_turn(
+            result.messages,
+            status=result.status,
+            steps=result.steps,
+            tokens=result.usage.get("total_tokens", 0),
+            model=model,
+        )
 
     if args.json:
         print(json.dumps(result.metrics(), indent=2))
@@ -402,9 +612,21 @@ def main(argv: list[str] | None = None) -> int:
         if stale:
             console.print(f"[dim]cleaned up {stale} orphaned container(s)[/dim]")
 
+    # Resolved before the executor is built, because the snapshot store is
+    # keyed by session id and has to be wrapped around the executor.
+    store, history = resolve_session(args, console, model)
+    if store is None and history is None and (args.resume is not None or args.fork):
+        return 130  # asked to resume something that could not be found
+
+    snapshots = SnapshotStore(
+        project=str(Path(args.workdir).resolve()),
+        session_id=store.session_id if store else "unsaved",
+        enabled=args.snapshots,
+    )
+
     renderer = Renderer(console, show_steps=args.steps)
     try:
-        executor, mounts = make_executor(args, console, renderer)
+        executor, mounts = make_executor(args, console, renderer, snapshots)
     except SandboxError as exc:
         # Docker is optional now that --here exists, so a missing daemon should
         # be a signpost rather than a dead end.
@@ -420,7 +642,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.task:
-            return run_once(args, executor, client, model, console, renderer)
+            return run_once(args, executor, client, model, console, renderer, store)
+
         return Session(
             executor,
             client,
@@ -435,6 +658,10 @@ def main(argv: list[str] | None = None) -> int:
             provider=args.provider or default_provider(),
             extras=build_agent_extras(args, executor, client, model, console),
             renderer=renderer,
+            store=store,
+            history=history,
+            snapshots=snapshots,
+            scaffold_context=getattr(args, "context", True) and not wants_sandbox(args),
         ).run()
     finally:
         executor.close()

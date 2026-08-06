@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from rich.console import Console
@@ -26,17 +27,22 @@ from .loop import (
     DEFAULT_CONTEXT_BUDGET,
     DEFAULT_MAX_ITERATIONS,
     agent_loop,
+    ensure_project_context,
     estimate_tokens,
     make_client,
 )
 from .models import list_models, rank_models
+from .permissions import MODE_HELP, Mode
 from .prompts import Choice, choose, interactive
 from .sandbox import SandboxError
+from .sessions import SessionStore, describe, fork, list_sessions
+from .snapshots import SnapshotStore
 from .tools import TOOL_NAMES, tools_for
 from .ui import (
     BRAND,
     MUTED,
     NOTE,
+    OK,
     OUTPUT,
     TOOL,
     WARN,
@@ -57,6 +63,11 @@ COMMANDS = {
     "/auth": "which providers are usable",
     "/provider": "switch provider, e.g. /provider gemini",
     "/model": "switch model, e.g. /model llama-3.1-8b-instant",
+    "/sessions": "past sessions in this project",
+    "/fork": "branch this conversation into a new session",
+    "/mode": "how much it may do before asking (manual, accept-edits, plan, auto)",
+    "/undo": "put back the last file the agent changed (/undo all for everything)",
+    "/changes": "files this session has changed",
     "/clear": "forget the conversation (the sandbox and its files stay)",
     "/files": "list files in the working directory",
     "/cost": "tokens used so far this session",
@@ -140,6 +151,10 @@ class Session:
         provider: str | None = None,
         extras: dict[str, Any] | None = None,
         renderer: Renderer | None = None,
+        store: SessionStore | None = None,
+        history: list[dict[str, Any]] | None = None,
+        scaffold_context: bool = True,
+        snapshots: SnapshotStore | None = None,
     ):
         self.context_budget = context_budget
         self.max_total_tokens = max_total_tokens
@@ -156,7 +171,12 @@ class Session:
         self.stream = stream
         self.console = Console()
         self.renderer = renderer or Renderer(self.console, show_steps=show_steps)
-        self.history: list[dict[str, Any]] | None = None
+        # Resumed sessions start with the previous conversation already loaded;
+        # a fresh one starts empty.
+        self.history: list[dict[str, Any]] | None = history or None
+        self.store = store
+        self.scaffold_context = scaffold_context
+        self.snapshots = snapshots
         self.total_tokens = 0
         self.total_steps = 0
         self.turns = 0
@@ -389,6 +409,142 @@ class Session:
         self.model = chosen
         self.console.print(f"[{NOTE}]model set to {self.model}[/{NOTE}]\n")
 
+    # -- sessions -----------------------------------------------------------
+
+    def _project_root(self) -> str:
+        return str(getattr(self.executor, "root", None) or Path.cwd())
+
+    def _cmd_sessions(self, _args: list[str]) -> None:
+        rows = list_sessions(self._project_root())
+        if not rows:
+            self.console.print(
+                f"[{MUTED}]no saved sessions for this project yet[/{MUTED}]\n"
+            )
+            return
+
+        table = Table(show_header=True, box=None, padding=(0, 2))
+        table.add_column("session", style=NOTE)
+        table.add_column("turns", style=MUTED, justify="right")
+        table.add_column("model", style=MUTED)
+        table.add_column("first prompt", style=OUTPUT)
+        for meta in rows:
+            current = self.store is not None and meta.session_id == self.store.session_id
+            marker = f" [{BRAND}]{glyph('bullet')}[/{BRAND}]" if current else ""
+            table.add_row(f"{meta.session_id}{marker}", str(meta.turns), meta.model, meta.label)
+        self.console.print(table)
+        self.console.print(
+            f"[{MUTED}]resume one with [/{MUTED}][{TOOL}]dietcode --resume <id>[/{TOOL}]"
+            f"[{MUTED}] {glyph('dot')} {glyph('bullet')} is this session[/{MUTED}]\n"
+        )
+
+    def _cmd_fork(self, _args: list[str]) -> None:
+        """Branch here, so the current conversation can be taken two ways."""
+        if self.store is None:
+            self.console.print(
+                f"[{WARN}]this session is not being saved, so there is nothing to "
+                f"fork[/{WARN}]\n"
+            )
+            return
+        if not self.history:
+            self.console.print(f"[{MUTED}]nothing to fork yet[/{MUTED}]\n")
+            return
+
+        new_id = fork(describe(self.store.path))
+        self.console.print(
+            f"[{NOTE}]forked to {new_id}[/{NOTE}] "
+            f"[{MUTED}]{glyph('dash')} this session carries on unchanged; open the "
+            f"branch with `dietcode --resume {new_id}`[/{MUTED}]\n"
+        )
+
+    # -- how much it may do without asking ----------------------------------
+
+    @property
+    def policy(self) -> Any:
+        """The gate's policy, if this session has a gate at all."""
+        return getattr(self.executor, "policy", None)
+
+    def _cmd_mode(self, args: list[str]) -> None:
+        policy = self.policy
+        if policy is None:
+            self.console.print(
+                f"[{MUTED}]this session has no permission gate, so there is no "
+                f"mode to set[/{MUTED}]\n"
+            )
+            return
+
+        if args:
+            try:
+                chosen: Any = Mode(args[0])
+            except ValueError:
+                names = ", ".join(m.value for m in Mode)
+                self.console.print(f"[red1]unknown mode {args[0]!r}[/red1] [{MUTED}]{names}[/{MUTED}]\n")
+                return
+        else:
+            chosen = choose(
+                self.console,
+                "How much should it do before asking?",
+                [Choice(m.value, m.value, MODE_HELP[m]) for m in Mode],
+                selected=str(policy.mode),
+            )
+            if chosen is None:
+                self.console.print()
+                return
+            chosen = Mode(chosen)
+
+        policy.mode = chosen
+        policy.yes_to_everything = chosen is Mode.AUTO
+        style = WARN if chosen is Mode.AUTO else NOTE
+        self.console.print(
+            f"[{style}]{chosen.value}[/{style}] [{MUTED}]{glyph('dash')} "
+            f"{MODE_HELP[chosen]}[/{MUTED}]"
+        )
+        if chosen is Mode.AUTO:
+            self.console.print(
+                f"[{MUTED}]/undo still puts back anything a file tool changed."
+                f"[/{MUTED}]"
+            )
+        self.console.print()
+
+    # -- undo ---------------------------------------------------------------
+
+    def _cmd_changes(self, _args: list[str]) -> None:
+        changes = self.snapshots.changes if self.snapshots else []
+        if not changes:
+            self.console.print(
+                f"[{MUTED}]nothing changed by a file tool this session[/{MUTED}]\n"
+            )
+            return
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        for change in changes:
+            table.add_row(f"[{MUTED}]{change.index}[/{MUTED}]", f"[{OUTPUT}]{change.label}[/{OUTPUT}]")
+        self.console.print(table)
+        self.console.print(
+            f"[{MUTED}]{glyph('dash')} shell commands are not tracked; /undo covers "
+            f"file tools only[/{MUTED}]\n"
+        )
+
+    def _cmd_undo(self, args: list[str]) -> None:
+        if self.snapshots is None or not self.snapshots.changes:
+            self.console.print(f"[{MUTED}]nothing to undo[/{MUTED}]\n")
+            return
+
+        everything = bool(args) and args[0] in ("all", "*")
+        lines = (
+            self.snapshots.undo_all(self.executor)
+            if everything
+            else self.snapshots.undo_last(self.executor)
+        )
+        for line in lines:
+            marker = glyph("tick") if line.startswith(("restored", "removed")) else glyph("cross")
+            style = OK if line.startswith(("restored", "removed")) else WARN
+            self.console.print(f"[{style}]{marker}[/{style}] [{OUTPUT}]{line}[/{OUTPUT}]")
+        # The conversation still says the edit happened, and that is correct --
+        # it did. Undo changes the files, not the history.
+        self.console.print(
+            f"[{MUTED}]{glyph('dash')} the agent still remembers making the change; "
+            f"tell it what you reverted[/{MUTED}]\n"
+        )
+
     def handle_command(self, text: str) -> bool:
         """Returns False when the session should end."""
         parts = text.strip().split()
@@ -405,6 +561,11 @@ class Session:
             "/provider": self._cmd_provider,
             "/model": self._cmd_model,
             "/doctor": self._cmd_doctor,
+            "/sessions": self._cmd_sessions,
+            "/fork": self._cmd_fork,
+            "/mode": self._cmd_mode,
+            "/undo": self._cmd_undo,
+            "/changes": self._cmd_changes,
             "/clear": self._cmd_clear,
             "/files": self._cmd_files,
             "/cost": self._cmd_cost,
@@ -422,7 +583,24 @@ class Session:
 
     # -- main loop ----------------------------------------------------------
 
+    def _scaffold_context(self) -> None:
+        """On the very first prompt, give a project with no instructions file one.
+
+        Deliberately on the first prompt rather than at launch: opening dietcode
+        to ask a question should not leave a file behind in someone's repo.
+        """
+        if self.turns or not self.scaffold_context:
+            return
+        created = ensure_project_context(self._project_root())
+        if created:
+            self.console.print(
+                f"[{NOTE}]created {created}[/{NOTE}] "
+                f"[{MUTED}]{glyph('dash')} standing instructions for this project; "
+                f"fill it in and every session picks it up[/{MUTED}]\n"
+            )
+
     def run_turn(self, task: str) -> None:
+        self._scaffold_context()
         started = time.monotonic()
         try:
             result = agent_loop(
@@ -454,6 +632,14 @@ class Session:
         self.total_tokens += result.usage.get("total_tokens", 0)
         self.total_steps += result.steps
         self.turns += 1
+        if self.store is not None:
+            self.store.record_turn(
+                result.messages,
+                status=result.status,
+                steps=result.steps,
+                tokens=result.usage.get("total_tokens", 0),
+                model=self.model,
+            )
         turn_footer(self.console, result, time.monotonic() - started)
 
     def run(self) -> int:

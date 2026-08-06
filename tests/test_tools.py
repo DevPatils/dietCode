@@ -269,3 +269,31 @@ def test_recovers_multiple_calls_in_one_message():
 )
 def test_does_not_invent_calls_from_ordinary_text(content):
     assert extract_tool_calls_from_text(content) == []
+
+
+def test_the_parenthesised_tag_format_is_recovered():
+    """Observed live from llama-3.3-70b, and it cost the whole run: the loop
+    saw no tool calls, recovery did not fire, and it stopped at step 1."""
+    calls = extract_tool_calls_from_text(
+        '<function(write_file)={"path": "ok.py", "content": "PASS = True"}></function>'
+    )
+    assert len(calls) == 1
+    assert calls[0]["name"] == "write_file"
+    assert json.loads(calls[0]["arguments"])["path"] == "ok.py"
+
+
+def test_a_doubled_closing_brace_does_not_defeat_recovery():
+    """The same live reply had `}}>` on the second call."""
+    calls = extract_tool_calls_from_text(
+        '<function(run_shell)={"command": "python -c \\"import ok\\""}}></function>'
+    )
+    assert len(calls) == 1
+    assert json.loads(calls[0]["arguments"])["command"] == 'python -c "import ok"'
+
+
+def test_two_parenthesised_calls_in_one_reply_both_recover():
+    calls = extract_tool_calls_from_text(
+        '<function(write_file)={"path": "a.py", "content": "x"}></function>\n'
+        '<function(run_shell)={"command": "ls"}></function>'
+    )
+    assert [c["name"] for c in calls] == ["write_file", "run_shell"]

@@ -363,6 +363,24 @@ class Renderer:
         for line in body.splitlines():
             self.console.print(f"[{MUTED}]{bar}[/{MUTED}] [{style}]{line}[/{style}]")
 
+    def _on_verifying(self, payload: dict[str, Any]) -> None:
+        self._stop_status()
+        self.console.print(
+            f"[{MUTED}]checking it really is done: {payload['command']}[/{MUTED}]"
+        )
+        self._start_status(f"running {payload['command'].split()[0]}")
+
+    def _on_verified(self, payload: dict[str, Any]) -> None:
+        self._stop_status()
+        self.console.print(f"[{OK}]{glyph('tick')}[/{OK}] [{MUTED}]it passes[/{MUTED}]")
+
+    def _on_verification_failed(self, payload: dict[str, Any]) -> None:
+        self._stop_status()
+        self.console.print(
+            f"[{WARN}]![/{WARN}] [{MUTED}]{payload['command']} still fails "
+            f"(exit {payload['exit_code']}); sent it back to fix it[/{MUTED}]"
+        )
+
     def _on_completion_deferred(self, payload: dict[str, Any]) -> None:
         self._stop_status()
         self.console.print(

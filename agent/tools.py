@@ -216,8 +216,12 @@ def tools_for(provider: str, tools: list[dict[str, Any]] | None = None) -> list[
 # through, the loop sees a turn with no tool calls and stops dead on step 1, so
 # recovering them is the difference between a task running and a task scoring 0.
 
-# Matches <function=name>, <function/name, <function name>, <function: name>.
-_FUNCTION_TAG_RE = re.compile(r"<function\s*[=/:]?\s*([A-Za-z_][\w.-]*)\s*>?", re.IGNORECASE)
+# Matches <function=name>, <function/name, <function name>, <function: name>,
+# and <function(name)= -- the last observed live from llama-3.3-70b, which cost
+# a whole run: no tool calls, no recovery, stopped at step 1.
+_FUNCTION_TAG_RE = re.compile(
+    r"<function\s*[=/:(]?\s*([A-Za-z_][\w.-]*)\s*\)?\s*[=:]?\s*>?", re.IGNORECASE
+)
 
 # Llama's native tool token, which precedes a bare JSON object.
 _PYTHON_TAG_RE = re.compile(r"<\|python_tag\|>")
