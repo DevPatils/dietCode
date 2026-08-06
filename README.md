@@ -1,9 +1,9 @@
 # CLI Coding Agent
 
-A command-line coding agent: an agentic loop with tool-calling that reads/writes
-files and runs shell commands until a task is done — in your own directory,
-asking before each change, or inside a Docker container. No agent
-framework — raw OpenAI-compatible API calls against Groq and a hand-rolled loop.
+A command-line coding agent: an agentic loop with tool-calling that reads and
+writes files and runs shell commands until a task is done, in the directory you
+are standing in, asking before each change. No agent framework, just raw
+OpenAI-compatible API calls and a hand-rolled loop.
 
 Benchmarked against Terminal-Bench.
 
@@ -15,14 +15,14 @@ Benchmarked against Terminal-Bench.
 pipx install dietcode
 ```
 
-Needs **Python 3.11+**. Docker is optional and only used by `--sandbox`.
+Needs **Python 3.11+**. Nothing else to install.
 
 `pipx` is recommended because it puts `dietcode` on your PATH and keeps its
 dependencies isolated. `pip install --user dietcode` works too, but on Windows
 you may then need to add `%APPDATA%\Python\Python311\Scripts` to PATH yourself.
 
 ```bash
-dietcode doctor         # checks Python, PATH, Docker and credentials
+dietcode doctor         # checks Python, PATH and credentials
 ```
 
 Then log in once:
@@ -52,7 +52,7 @@ dietcode
 ```
 
 It works in the directory you are standing in, and asks before anything that
-writes, deletes, or reaches outside it. Docker is not required.
+writes, deletes, or reaches outside it.
 
 <details>
 <summary>Running from a checkout instead</summary>
@@ -68,28 +68,23 @@ A `.env` with `GROQ_API_KEY=...` also works when running from a checkout.
 
 </details>
 
-**Troubleshooting** — `dietcode doctor` diagnoses all of these:
+**Troubleshooting.** `dietcode doctor` diagnoses all of these:
 
 | Symptom | Cause |
 | --- | --- |
-| `dietcode: command not found` | its Scripts/bin dir is not on PATH — use `pipx` |
+| `dietcode: command not found` | its Scripts/bin dir is not on PATH, use `pipx` |
 | `no credentials for ...` | run `dietcode login` |
-| Docker errors with `--sandbox` | Docker isn't running — drop the flag to work locally |
-| files disappear after a run | you used `--sandbox` without `--mount` |
+| every action is denied | stdin is not a terminal, so nothing can answer the prompt |
+| `daily quota used up` | that model's free tier is spent, switch with `/model` |
 
-## Two ways to run
+## How it decides what it may do
 
-| | What it does | Safety |
-| --- | --- | --- |
-| `dietcode` | Works in the current directory | Consent — asks before each change |
-| `dietcode --sandbox` | Runs inside a Docker container | Containment — cannot reach anything you did not mount |
-
-**The default asks.** Read-only commands (`ls`, `cat`, `git status`) run
-without prompting; anything that writes, deletes, or reaches outside the
-directory stops first with `[enter] yes  [a] always allow  [n] no`. Enter
-approves, because approving reads is most of what the prompt does — except for
-destructive commands and anything outside the working directory, where a reflex
-keypress should not be enough.
+**The default asks.** Read-only commands (`ls`, `cat`, `git status`) run without
+prompting; anything that writes, deletes, or reaches outside the directory stops
+first with `[enter] yes  [a] always allow  [n] no`. Enter approves, because
+approving reads is most of what the prompt does. It does not approve destructive
+commands or anything outside the working directory, where a reflex keypress
+should not be enough.
 
 **How much it does before asking is a mode**, set with `--mode` or `/mode`:
 
@@ -101,23 +96,20 @@ keypress should not be enough.
 | `auto` | do everything without asking (`--yes` is the same thing) |
 
 `accept-edits` covers writes *inside* the working directory only. `plan` refuses
-without prompting — a prompt you are not allowed to say yes to is theatre — and
-tells the model it is planning, so it describes the change instead of retrying.
+without prompting, because a prompt you are not allowed to say yes to is theatre,
+and it tells the model it is planning so it describes the change instead of
+retrying.
 
-**Every file change is snapshotted first**, so the looser modes are recoverable:
+**Every file change is snapshotted first**, so the looser modes are recoverable.
 `/undo` puts the last one back, `/undo all` reverts everything this session
-touched, and `/changes` lists them. Shell commands are not tracked — guessing
+touched, and `/changes` lists them. Shell commands are not tracked: guessing
 which paths a command will write is worse than being clear that undo covers file
 tools only.
 
-**The sandbox contains.** `--sandbox` puts everything in a container capped at
-2 GB memory, 2 CPUs and 512 PIDs. Add `--mount ./dir` to let files persist, or
-`--no-network` to cut it off entirely. Either flag implies `--sandbox`.
-
-The difference matters: a container is a boundary, a prompt is a decision. A
-shell command can always `cd ..`, so the default protects you by showing what
-is about to happen, not by making escape impossible. For code you do not
-trust, use `--sandbox`.
+A prompt is a decision, not a boundary. A shell command can always `cd ..`, so
+what protects you here is seeing what is about to happen and being able to put it
+back, not being unable to leave the folder. Do not point it at code you actively
+distrust.
 
 ## Usage
 
@@ -127,7 +119,7 @@ Run with no arguments for an interactive session in the current directory:
 dietcode
 ```
 
-One session keeps its conversation and its files — the agent remembers
+One session keeps its conversation and its files. The agent remembers
 what it did on previous turns and the files it built are still there. Ctrl+C
 interrupts a turn without quitting.
 
@@ -138,29 +130,22 @@ interrupts a turn without quitting.
 | `/undo`, `/changes` | put back a file it changed; see what it touched |
 | `/sessions`, `/fork` | past conversations here; branch this one |
 | `/model`, `/provider` | switch either, mid-session |
-| `/cost`, `/files`, `/sandbox` | tokens spent, files here, container info |
+| `/cost`, `/files` | tokens spent, files in the working directory |
 | `/clear` | forget the conversation, keep the files |
 | `/login`, `/logout`, `/auth`, `/doctor` | credentials and setup |
 | `/exit` | quit (also Ctrl+D) |
 
-Or pass a task to run once and exit — used for scripting and the benchmark:
+Or pass a task to run once and exit, which is what scripting and the benchmark
+use:
 
 ```bash
 dietcode "add a test for the parser and make it pass"
 ```
 
-To run the same thing inside a container instead, add `--sandbox`. Note that a
-container is thrown away when the run ends, so mount a directory if you want
-the files to survive:
-
-```bash
-dietcode --sandbox --mount ./my-project "add a test for the parser"
-```
-
 ### Sessions
 
 Every conversation is written to a JSONL transcript under
-`~/.dietcode/projects/<project>/` — not into your repo, because a transcript
+`~/.dietcode/projects/<project>/`, not into your repo, because a transcript
 holds every file the agent read and every line of shell output.
 
 ```bash
@@ -186,7 +171,7 @@ opinion.
 ### What it remembers
 
 On your first prompt in a project with no instructions file, dietcode creates
-`DIETCODE.md` — standing instructions prepended to every session. Fill it in and
+`DIETCODE.md`, standing instructions prepended to every session. Fill it in and
 every run picks it up. It also keeps its own notes in
 `~/.dietcode/projects/<project>/memory/memory.md`, which it may write and you may
 edit; your instructions file stays read-only to it, so a run cannot rewrite its
@@ -204,17 +189,10 @@ own brief.
 | `--no-context` | ignore the project's `DIETCODE.md` / `AGENTS.md` / `CLAUDE.md` |
 | `--provider groq\|gemini\|openai` | which API to use (default: your saved login) |
 | `--base-url URL` | any OpenAI-compatible endpoint (Ollama, vLLM, OpenRouter) |
-| `--no-network` | cut the sandbox off from the network entirely |
 | `--max-tokens N` | hard spend ceiling per task |
 | `--context-budget N` | trim the oldest turns above this prompt size (default 48000) |
-| `--memory` / `--cpus` / `--pids-limit` | container resource caps (default 2g / 2 / 512) |
-| `--cleanup` | remove every leftover agent container and exit |
-| `--sandbox` | run inside a Docker container instead of the current directory |
-| `--mount HOSTDIR[:TARGET]` | bind-mount a directory into the container. Implies `--sandbox` |
 | `--yes` | approve every action without asking (dangerous) |
-| `--container NAME` | attach to an existing container instead of creating one |
-| `--image IMAGE` | sandbox image (default `python:3.11-slim`) |
-| `--model NAME` | default `llama-3.3-70b-versatile` |
+| `--model NAME` | override the provider's default |
 | `--max-iterations N` | default 12 |
 | `--json` | print metrics as JSON |
 | `--quiet` | only print the final result |
@@ -224,7 +202,7 @@ Exit code is 0 when the agent called `task_complete`, 1 otherwise.
 ## Tests
 
 ```bash
-python -m pytest                       # Docker tests skip if the daemon is down
+python -m pytest                        # the whole suite
 python -m pytest tests/test_loop.py     # one file
 python -m pytest -k timeout             # one test
 ```
@@ -236,13 +214,13 @@ needs no API key and makes no network calls.
 
 ```
 interactive ─┐
-one-shot   ──┼─> agent_loop ──> execute_tool ──> Executor ──> container
+one-shot   ──┼─> agent_loop ──> execute_tool ──> Executor ──> your files
 tb run     ──┘   (agent/loop.py)  (agent/tools.py)  (agent/sandbox.py)
 ```
 
-All three entrypoints run the same loop. Interactive mode differs only in that
-it passes the previous turn's `messages` back in as `history` and reuses one
-container; rendering lives in `agent/ui.py` so the loop stays UI-free and the
+All three entrypoints run the same loop, and differ only in which `Executor` is
+passed to it. Interactive mode also feeds the previous turn's `messages` back in
+as `history`. Rendering lives in `agent/ui.py` so the loop stays UI-free and the
 benchmark can run it with no console attached.
 
 Replies stream token by token in both human-facing modes. `agent_loop(stream=…)`
@@ -257,7 +235,7 @@ results back, and repeats until `task_complete`, a turn with no tool calls, or
 `max_iterations`.
 
 **Tools:** `read_file`, `write_file`, `edit_file`, `find_files`, `search`,
-`run_shell`, `task_complete` — plus `spawn_subagent` behind `--subagents`.
+`run_shell`, `task_complete`, plus `spawn_subagent` behind `--subagents`.
 
 `edit_file` replaces an exact snippet rather than rewriting the file, so a
 one-line change costs one line instead of four hundred. It refuses rather than
@@ -265,7 +243,7 @@ guesses: no match, or an ambiguous match, is an error explaining what to fix.
 
 `--subagents` lets the agent delegate self-contained work to a fresh agent that
 shares the files but not the conversation, and reports back only a summary.
-The context isolation is the point — passing the transcript back would cost as
+The context isolation is the point. Passing the transcript back would cost as
 much as doing the work inline.
 
 **Project instructions.** If the working directory has a `DIETCODE.md`,
@@ -288,38 +266,44 @@ gets passed in, so both run identical tool code.
   stopped on step 1 with the task untouched. `extract_tool_calls_from_text`
   parses the known text formats, and the recovered call is rewritten into the
   transcript in correct structural form. Counted separately as
-  `recovered_tool_calls` — it measures the model, not the scaffold.
+  `recovered_tool_calls`, because it measures the model, not the scaffold.
 - **File tools go through the executor, not the host filesystem.** Otherwise the
   benchmark agent would read the host while its shell acts in the container.
 - **`task_complete` batched with the work gets deferred.** Models often emit
   write + run + `task_complete` in a single turn, declaring the output verified
   before a single tool result existed. One run wrote bash into a `.py` file, got
-  a `SyntaxError`, and claimed success in the same breath — it would have scored
+  a `SyntaxError`, and claimed success in the same breath. It would have scored
   a false pass. The loop now feeds the results back and requires
   `task_complete` on its own turn.
 - **Schemas stay permissive where the dispatcher coerces.** Groq validates tool
   arguments server-side and 400s the whole generation on a mismatch; a model
   sending `"timeout": "10"` killed a run. The rejected text comes back in
   `failed_generation`, so the call is salvaged from it rather than lost.
-- **The shell wrapper persists the working directory** between calls. Each
-  `docker exec` is a fresh process, so `cd /app` in one command would be silently
-  lost by the next.
+- **The shell wrapper persists the working directory** between calls. Each one
+  is a fresh process, so `cd src` in one command would otherwise be silently lost
+  by the next, and the agent would be acting blind.
 - **Written file content is base64'd over argv**, so nothing the model generates
   can be reinterpreted as shell syntax. Costs a ~1MB write ceiling (`ARG_MAX`).
 
 ## Limits and isolation
 
-The agent runs shell commands an LLM wrote, so containers are capped by default:
-**2 GB memory, 2 CPUs, 512 PIDs**, plus `no-new-privileges`. The PID cap is what
-stops a fork bomb from wedging the Docker VM rather than just failing a command.
+The agent runs shell commands an LLM wrote, in your own directory. Three things
+stand between it and a mess:
 
-Networking is **on** by default (the agent often needs `pip install`). Use
-`--no-network` for untrusted work — note that combined with `--mount`, a
-networked agent can read your mounted files and send them somewhere.
+**It asks.** Anything that writes, deletes, or reaches outside the working
+directory stops for approval, and the strictest segment of a compound command
+decides. `git status && rm -rf build` is a destructive command, not a read.
 
-Every container is labelled, and startup sweeps ones older than 6 hours left
-behind by a crash. `--cleanup` removes them all now. This matters because
-`close()` only runs on a clean exit — SIGKILL leaks a container otherwise.
+**It keeps a copy.** Every file a tool changes is snapshotted first, so `/undo`
+and `/undo all` put things back. Copies live in `~/.dietcode`, never in your
+project.
+
+**It records what happened.** The full transcript of every session is on disk, so
+you can go back and read exactly which command did what.
+
+None of that is containment. A shell command can leave the folder, and `--yes`
+or `--mode auto` turns the asking off entirely. Point it at work you are willing
+to review, and read the prompts.
 
 Long sessions trim their own history: above `--context-budget` tokens the oldest
 turns are dropped, always keeping tool calls and their results together (splitting
@@ -339,7 +323,7 @@ wsl bash scripts/benchmark.sh broken-python   # a single task
 DATASET=terminal-bench-core==0.1.1 wsl bash scripts/benchmark.sh ""   # everything
 ```
 
-Docker Desktop's WSL integration means WSL shares the same daemon — no second
+Docker Desktop's WSL integration means WSL shares the same daemon, so no second
 install. The agent itself is fine on Windows; only the harness is not.
 
 <details>
@@ -352,7 +336,7 @@ install. The agent itself is fine on Windows; only the harness is not.
    `original-tasks/`. Pin `==0.1.1` (commit `91e10457b5`).
 3. **Windows blocker:** container paths are built with `pathlib.Path`, so `/tmp`
    becomes `\tmp` and the run dies in `TmuxSession.__init__` with
-   `404 Could not find the file \tmp` — before the agent is ever called. The
+   `404 Could not find the file \tmp`, before the agent is ever called. The
    `0.00%` this produces is not a score; check `total_input_tokens: null` in
    `results.json` to tell "harness failed" from "agent failed".
 4. It finishes by printing `output_path.absolute()`, which calls `os.getcwd()`.
@@ -364,7 +348,7 @@ install. The agent itself is fine on Windows; only the harness is not.
 `tb` does not read `.env`; the adapter loads it itself, and the script exports
 the key as well in case the harness's isolated environment lacks python-dotenv.
 
-Use a fixed ~15–20 task subset while iterating — not the full suite, and not
+Use a fixed 15 to 20 task subset while iterating, not the full suite, and not
 repeatedly. Groq's free tier is ~1,000 requests/day and each task burns one
 request per loop step.
 
@@ -373,7 +357,7 @@ logging directory; they are the input to the failure-mode table below.
 
 ### Results
 
-**Smoke test only so far — one task, which is not a score.**
+**Smoke test only so far: one task, which is not a score.**
 
 | Task | Result | Steps | Tokens | Notes |
 | --- | --- | --- | --- | --- |
@@ -384,8 +368,8 @@ rather than extrapolating from a single task.
 
 | | Resolution rate | Avg steps | Avg tokens |
 | --- | --- | --- | --- |
-| This agent | — | — | — |
-| Terminus (reference) | — | — | — |
+| This agent | n/a | n/a | n/a |
+| Terminus (reference) | n/a | n/a | n/a |
 
 #### What the first pass showed
 
@@ -404,11 +388,12 @@ interesting number here, not the pass.
 
 ## Status
 
-Built and working end to end: tool dispatch, agent loop, Docker sandbox, CLI,
+Built and working end to end: tool dispatch, agent loop, permission gate,
+sessions with resume and fork, snapshots and undo, project memory, CLI, and the
 Terminal-Bench adapter.
 
 First real run, `"write a python script that prints the first 20 primes and run it"`
-on `llama-3.3-70b-versatile` — completed in 4 steps / 4658 tokens:
+on `llama-3.3-70b-versatile`, completed in 4 steps / 4658 tokens:
 
 | Step | What happened |
 | --- | --- |
@@ -418,8 +403,7 @@ on `llama-3.3-70b-versatile` — completed in 4 steps / 4658 tokens:
 | 4 | `task_complete` |
 
 Not yet done:
-- A benchmark run.
-- Stretch goal: `spawn_subagent` — a fresh loop with isolated message history
+- Stretch goal: `spawn_subagent`, a fresh loop with isolated message history
   that returns only its final summary to the parent. `agent_loop` takes an
   `extra_tool_handlers` hook for exactly this, and the hook is tested; the tool
   itself is deliberately left until there is a baseline score to compare against.

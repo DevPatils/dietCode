@@ -35,7 +35,7 @@ execute identical code. Console script is `dietcode = "agent.cli:entrypoint"`.
 
 **Credentials never live in the project.** [agent/auth.py](agent/auth.py) stores keys in
 the OS keychain, falling back to `~/.dietcode/credentials.json` at 0600. Resolution
-order is env var, then saved login — the env var wins so CI can override without
+order is env var, then saved login. The env var wins so CI can override without
 touching a user's login. Keys are cleaned of BOMs and zero-width characters on the way
 in: `str.strip()` leaves them, and PowerShell adds a BOM when piping, which silently
 corrupts the stored key and surfaces later as an unexplained 401.
@@ -47,7 +47,7 @@ terminal-bench requires ≥3.12 and is installed on 3.13. So:
 py -3.13 -m pytest tests/test_adapter.py   # adapter tests SKIP on 3.11 -- run them here
 ```
 
-**The benchmark harness does not run on Windows** — it builds container paths with
+**The benchmark harness does not run on Windows**: it builds container paths with
 `pathlib`, so `/tmp` becomes `\tmp` and it dies in `TmuxSession.__init__` before the
 agent is called. Run it from WSL via the wrapper, which encodes four separate
 0.2.18 workarounds (see the README's benchmark section):
@@ -60,7 +60,7 @@ wsl bash scripts/benchmark.sh broken-python   # one task
 A harness `0.00%` is ambiguous: check `total_input_tokens` in `results.json`. `null`
 means the harness failed before the agent ran, not that the agent failed.
 
-A green `python -m pytest` does **not** mean the adapter is tested — it skips silently
+A green `python -m pytest` does **not** mean the adapter is tested: it skips silently
 on 3.11. Run the 3.13 command too before claiming the adapter works.
 
 The loop tests use a scripted fake client ([tests/fake_llm.py](tests/fake_llm.py)), so
@@ -76,21 +76,21 @@ tb run     ──┘   agent/loop.py   agent/tools.py   agent/sandbox.py
 
 `python cli.py` with no task argument enters the interactive session; with a task
 it runs once and exits. Interactive mode reuses one container and feeds the previous
-turn's `.messages` back in as `history` — that is the *only* behavioural difference.
+turn's `.messages` back in as `history`, which is the *only* behavioural difference.
 `history` is copied, not mutated, so an interrupted turn cannot leave the caller with
 a transcript containing unanswered tool calls (which the API rejects).
 
 Everything that reads a keypress lives in `agent/prompts.py` (pickers, confirm, secret
 entry) and `agent/completion.py` (slash completion). `agent/models.py` asks a provider
 what it will actually accept, filtering `/models` down to ids that can drive a
-tool-calling loop — an embedding id in the picker is a 400 waiting to happen.
+tool-calling loop, because an embedding id in the picker is a 400 waiting to happen.
 
 **Rendering stays in `agent/ui.py`.** The loop emits events and never prints, so the
 benchmark adapter runs it with no console attached. Anything that makes `agent_loop`
 aware of a terminal breaks that.
 
 **Streaming is opt-in (`stream=True`), and the benchmark deliberately leaves it off.**
-Streaming requires reassembling tool calls from fragments — more machinery to go wrong,
+Streaming requires reassembling tool calls from fragments, which is more machinery to go wrong,
 for output no scored run watches. Both transports normalize to `Completion(content,
 tool_calls, usage)` in `_from_response` / `_from_stream`, so the loop body is transport-
 agnostic. When adding a field to a model turn, add it to `Completion` and to *both*
@@ -102,34 +102,34 @@ accumulated but an immediate repeat is skipped, since some providers send the na
 in every delta and others chunk it; usage arrives in a final chunk with **no choices**,
 so a `continue` on empty choices before reading usage blanks the token column;
 `stream_options={"include_usage": True}` is not universally supported and falls back.
-When streaming, the loop emits `assistant_delta` and suppresses `assistant_text` —
+When streaming, the loop emits `assistant_delta` and suppresses `assistant_text`:
 emitting both double-prints the reply.
 
 The load-bearing idea: **the CLI and the benchmark differ only in which `Executor` is
 passed to `agent_loop`.** [adapters/terminal_bench.py](adapters/terminal_bench.py)'s
 `SessionExecutor` subclasses `DockerExecutor` and overrides exactly one method,
-`_raw_exec`. Everything else — tool logic, cwd persistence, file encoding — is inherited,
+`_raw_exec`. Everything else (tool logic, cwd persistence, file encoding) is inherited,
 so the benchmark exercises the same code the CLI does. Adding a second implementation of
 any tool behaviour in the adapter defeats the entire design.
 
 `agent_loop` returns an `AgentResult` with status `complete` | `stopped` |
 `max_iterations_reached` | `budget_exhausted` | `error`, plus steps, tool-call counts
-and token usage — `.metrics()` is what feeds the README table.
+and token usage. `.metrics()` is what feeds the README table.
 
 **Seven tools.** `read_file`, `write_file`, `edit_file`, `find_files`, `search`,
 `run_shell`, `task_complete`. `spawn_subagent` is an eighth, opt-in via `--subagents`.
 
 - **`edit_file` never guesses.** A snippet matches exactly once or the call fails with
-  a reason the model can act on — including a specific "the text is there but the
+  a reason the model can act on, including a specific "the text is there but the
   whitespace differs" hint, which is the usual cause. Editing the wrong place silently
   is worse than not editing.
 - **`find_files` / `search` live on the `Executor`, not in tools.py.** The two backends
   do them completely differently: the container has `find` and `grep`, the host may be
   Windows and have neither. A shell-based implementation in tools.py broke `--here` on
-  Windows — that is why the capability moved down a layer.
+  Windows, which is why the capability moved down a layer.
 - **`spawn_subagent` returns only the child's summary.** The isolation is the mechanism
   being tested; passing the transcript back would grow the parent's context exactly as
-  fast as doing the work inline. Depth is capped at 1 — a child that can spawn children
+  fast as doing the work inline. Depth is capped at 1, because a child that can spawn children
   recurses until the daily request quota is gone.
 
 **Project instructions** (`DIETCODE.md`, `AGENTS.md`, `CLAUDE.md`, `.cursorrules`) are
@@ -150,11 +150,11 @@ These encode failures already hit; changing them will silently break runs.
   `extract_tool_calls_from_text` recovers the known formats and the loop rewrites the
   call into the transcript structurally (clearing the malformed text, so history shows
   the model a correct example). It must never invent a call from prose that merely
-  mentions a tool — recovery is gated on the name matching a real tool and the arguments
+  mentions a tool. Recovery is gated on the name matching a real tool and the arguments
   decoding as JSON. Tracked as `recovered_tool_calls`, separate from `tool_errors`,
   because it measures the model rather than the scaffold.
 - **`task_complete` batched with the work is deferred, not honoured.** Models routinely
-  emit the whole task — write, run, *and* `task_complete` — in one turn, declaring the
+  emit the whole task (write, run, *and* `task_complete`) in one turn, declaring the
   output verified before any tool result existed. Observed live: a run wrote bash into a
   `.py` file, got a `SyntaxError`, and claimed success in the same breath. The loop now
   runs every call in the batch, hands back the results, and requires `task_complete` on
@@ -162,7 +162,7 @@ These encode failures already hit; changing them will silently break runs.
   still terminates. Never `return` mid-batch: it skips later calls and leaves their
   `tool_call_id`s unanswered, corrupting the transcript.
 - **Tool schemas must be permissive where the dispatcher coerces.** Groq validates tool
-  arguments against `TOOLS` server-side and rejects the entire generation with a 400 —
+  arguments against `TOOLS` server-side and rejects the entire generation with a 400:
   a model sending `"timeout": "10"` killed a run, even though `_coerce_timeout` handles
   it fine. Hence `timeout` accepts `["integer", "string"]`. When it happens anyway, the
   400 body carries `failed_generation`, and `failed_generation_text` salvages the call
@@ -176,7 +176,7 @@ These encode failures already hit; changing them will silently break runs.
 - **The shell wrapper persists the working directory across calls** via
   `/tmp/.agent_cwd`. Each `docker exec` is a fresh process, so `cd /app` would otherwise
   be lost by the next command and the agent would act blind. The `pwd` capture must
-  happen *in the same shell that ran the command* — capturing it in the outer wrapper
+  happen *in the same shell that ran the command*. Capturing it in the outer wrapper
   records the wrapper's directory and loses every `cd`.
 - **The agent's command reaches the shell as an argv element, never interpolated** into
   the wrapper script; file content is base64'd over argv. Nothing the model generates can
@@ -188,12 +188,12 @@ These encode failures already hit; changing them will silently break runs.
   tell whether the owning process is alive, and killing a container out from under a
   running session is worse than leaving a stale one.
 - **Trimming must never split a tool_call from its tool result.** `trim_messages` groups
-  messages into atomic blocks via `_blocks()` for exactly this reason — half a pair makes
+  messages into atomic blocks via `_blocks()` for exactly this reason: half a pair makes
   the API reject the entire request. It also drops any leading orphan `tool` message.
   Trimming applies to what is *sent*; `result.messages` keeps the full transcript.
 - **On `context_length_exceeded`, shrink relative to what was actually sent**, not to the
   configured budget. Halving a 48k budget when the real payload is 2k changes nothing and
-  the retry sends an identical request — that exact bug was caught by a test.
+  the retry sends an identical request. That exact bug was caught by a test.
 - **Classify retryable errors by type and status, not message text** (`_is_transient`).
   String-matching an error body is how the `tool_use_failed` bug hid; a typed 4xx must
   never be retried.
@@ -214,7 +214,7 @@ These encode failures already hit; changing them will silently break runs.
   a spinner over the same line, so the keystrokes vanish and the user answers the
   permission gate blind. `ui._read_answer` and `prompts.confirm` both own the line.
 - **Enter approves only what is safe to approve by reflex.** The permission prompt
-  defaults to yes, because approving reads is most of what it does — but not for
+  defaults to yes, because approving reads is most of what it does, but not for
   `Risk.DANGEROUS` or anything `outside_root`.
 - **A picker with no terminal cancels; it never guesses.** `prompts.choose` returns
   `None` when stdin is not a tty. Returning the first option would silently change a
@@ -223,17 +223,17 @@ These encode failures already hit; changing them will silently break runs.
   called `main()` loaded the developer's `.env`, found a real key and spent tokens on a
   live request. httpx is blocked; the Docker tests use requests and still work.
 - **`load_dotenv` must be given `find_dotenv(usecwd=True)`.** The default searches
-  upward from the calling *file*, which inside a pipx install is site-packages — so an
+  upward from the calling *file*, which inside a pipx install is site-packages, so an
   installed `dietcode` never saw the `.env` in the directory the user was standing in.
 
 ## Constraints from the plan
 
-- **No agent framework** — raw OpenAI-compatible calls against Groq
+- **No agent framework**: raw OpenAI-compatible calls against Groq
   (`https://api.groq.com/openai/v1`), model `llama-3.3-70b-versatile`, fallback
   `qwen/qwen3-32b` only if tool-calling is worse on the primary.
-- **Keep `max_iterations` at 10–15.** Groq's free tier is ~1,000 requests/day and each
+- **Keep `max_iterations` at 10 to 15.** Groq's free tier is ~1,000 requests/day and each
   loop step is one request.
-- **Never run the full 89-task suite while iterating** — fixed ~15–20 task subset.
+- **Never run the full 89-task suite while iterating**: a fixed 15 to 20 task subset.
 - Full-file overwrite is fine for `write_file`; no diff-based editing, no UI beyond CLI.
 
 ## The session architecture
@@ -256,7 +256,7 @@ prompt ──> session ──> context assembly ──> MODEL ──> pick a too
 **The session is the unit of state, not the process** (`agent/sessions.py`). A prompt
 opens a session; the session is a JSONL transcript under
 `~/.dietcode/projects/<slug>/`. Resume is a read (`--resume`, `--continue`), fork is a
-copy of a prefix (`--fork`, `/fork`) — both fall out of the transcript being a file, and
+copy of a prefix (`--fork`, `/fork`). Both fall out of the transcript being a file, and
 neither needed its own mechanism. One-shot runs persist too, so
 `dietcode "do a thing"` then `dietcode --continue` works.
 
@@ -267,13 +267,13 @@ directory that gets committed.
 **Append-only, one message per line.** A single JSON document rewritten each turn loses
 the whole conversation to one interrupted write; with JSONL a killed session is readable
 up to its last complete line, and `load_messages` skips a torn tail. Only the new tail
-is appended each turn — the loop hands back the entire conversation every time, so
+is appended each turn, because the loop hands back the entire conversation every time, so
 re-writing all of it would grow the file quadratically. **A resumed session must set
 `_written` to what is already on disk**, or turn two writes the whole history a second
 time.
 
 **Instructions the user owns, memory the agent owns.** `DIETCODE.md` is scaffolded on
-the *first prompt* of a project that has no instructions file — from the host, before
+the *first prompt* of a project that has no instructions file: from the host, before
 the loop, never through the `Executor`, and only ever created. The agent still cannot
 rewrite its own standing orders mid-run. What it can write is `memory/memory.md`
 (`agent/memory.py`, the `remember` tool), kept beside the transcripts and folded into
@@ -285,18 +285,18 @@ ask a question should leave nothing behind in someone's repo.
 
 **Execution gates are a mode, not a question per call** (`permissions.Mode`): `manual`,
 `accept-edits`, `plan`, `auto`, via `--mode` or `/mode`. The answer to "may I write this
-file" is almost never about the file — it is about how much you trust this run.
+file" is almost never about the file. It is about how much you trust this run.
 `accept-edits` lets writes *inside the working directory* through and still asks before
 commands; outside it, it asks, because nothing about the mode says "edit the rest of the
-disk". `plan` refuses without prompting — a prompt you are not allowed to say yes to is
-theatre — and tells the model it is planning, so it describes the change instead of
+disk". `plan` refuses without prompting, because a prompt you are not allowed to say yes to is
+theatre, and it tells the model it is planning, so it describes the change instead of
 retrying.
 
 **A snapshot is taken before every file change** (`agent/snapshots.py`), which is what
 makes the looser modes survivable: `/undo` and `/undo all` put files back. Implemented
 as an `Executor` wrapper **inside** the gate, so an approved write is snapshotted and a
 denied one is not, and taking the copy never triggers a read prompt. Shell commands are
-deliberately not snapshotted — guessing which paths a command will write is worse than
+deliberately not snapshotted: guessing which paths a command will write is worse than
 being honest that undo covers file tools only.
 
 **Restoring must go through the unwrapped executor.** Writing a restore back through the
@@ -309,7 +309,7 @@ command is configured, `task_complete` does not end the loop until that command 
 a failure is handed back with its output and the model keeps working. Bounded by
 `MAX_VERIFY_ATTEMPTS` for the same reason the deferral cap exists.
 
-Terminal-Bench grades by inspecting final container state, not the agent transcript — a
+Terminal-Bench grades by inspecting final container state, not the agent transcript. A
 run that looks correct in the log can still fail. Note also that `SessionExecutor`
 bypasses tmux, so agent commands do not appear in a task's asciinema recording; use the
 `transcript.json` written to the harness logging dir for failure analysis.

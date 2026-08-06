@@ -30,7 +30,7 @@ from .tools import parse_arguments
 # session down. Detect it once and fall back to ASCII rather than crash.
 _UNICODE = {
     "tick": "✓", "cross": "✗", "circle": "○", "bullet": "▪",
-    "arrow": "→", "prompt": "❯", "dash": "—", "dot": "·", "ellipsis": "…",
+    "arrow": "→", "prompt": "❯", "dash": "-", "dot": "·", "ellipsis": "…",
     "bar": "│",
 }
 _ASCII = {
@@ -176,12 +176,12 @@ def humanize_error(message: str) -> tuple[str, str]:
             if allowed == "0":
                 return (
                     f"{model_id} is not available on your plan",
-                    "the free tier allows 0 requests for it — switch with /model",
+                    "the free tier allows 0 requests for it. Switch with /model",
                 )
             return (
                 f"daily quota used up for {model_id}",
                 f"the free tier allows {allowed} requests a day for that model "
-                f"— switch with /model, or change provider with /provider",
+                f"Switch with /model, or change provider with /provider",
             )
 
         if "per day" in low or "tpd" in low:
@@ -191,7 +191,7 @@ def humanize_error(message: str) -> tuple[str, str]:
                 if used and limit
                 else "the free tier resets on a rolling 24h window"
             )
-            return headline, f"{detail} — try a different model, or wait for the reset"
+            return headline, f"{detail}. Try a different model, or wait for the reset"
         headline = "rate limited"
         return headline, (
             f"retry in {retry.group(1)}" if retry else "too many requests just now"
