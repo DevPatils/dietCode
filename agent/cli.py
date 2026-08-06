@@ -94,8 +94,11 @@ def build_parser() -> argparse.ArgumentParser:
         'e.g. --verify "python -m pytest -q"',
     )
     model.add_argument(
+        # Not --no-memory: that collides with the container's --memory cap,
+        # which shares the dest and ends up True instead of "2g".
+        "--no-notes",
         "--no-memory",
-        dest="memory",
+        dest="notes",
         action="store_false",
         help="do not load or write the agent's notes for this project",
     )
@@ -443,7 +446,7 @@ def build_agent_extras(
 
     handlers: dict[str, Any] = {}
 
-    if getattr(args, "memory", True):
+    if getattr(args, "notes", True):
         # The agent's own notes, kept apart from the user's instructions: it
         # may write these, and must not be able to write those.
         project = str(Path(args.workdir).resolve())

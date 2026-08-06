@@ -7,6 +7,8 @@ framework — raw OpenAI-compatible API calls against Groq and a hand-rolled loo
 
 Benchmarked against Terminal-Bench.
 
+![dietcode running in a terminal](docs/screenshot.png)
+
 ## Install
 
 ```bash
@@ -84,8 +86,29 @@ A `.env` with `GROQ_API_KEY=...` also works when running from a checkout.
 
 **The default asks.** Read-only commands (`ls`, `cat`, `git status`) run
 without prompting; anything that writes, deletes, or reaches outside the
-directory stops first with `[y] yes  [a] always allow  [n] no`. `--yes` skips
-every prompt and is exactly as dangerous as it sounds.
+directory stops first with `[enter] yes  [a] always allow  [n] no`. Enter
+approves, because approving reads is most of what the prompt does — except for
+destructive commands and anything outside the working directory, where a reflex
+keypress should not be enough.
+
+**How much it does before asking is a mode**, set with `--mode` or `/mode`:
+
+| Mode | |
+| --- | --- |
+| `manual` | ask before every command and every write (default) |
+| `accept-edits` | write files freely, still ask before running commands |
+| `plan` | read and think, change nothing |
+| `auto` | do everything without asking (`--yes` is the same thing) |
+
+`accept-edits` covers writes *inside* the working directory only. `plan` refuses
+without prompting — a prompt you are not allowed to say yes to is theatre — and
+tells the model it is planning, so it describes the change instead of retrying.
+
+**Every file change is snapshotted first**, so the looser modes are recoverable:
+`/undo` puts the last one back, `/undo all` reverts everything this session
+touched, and `/changes` lists them. Shell commands are not tracked — guessing
+which paths a command will write is worse than being clear that undo covers file
+tools only.
 
 **The sandbox contains.** `--sandbox` puts everything in a container capped at
 2 GB memory, 2 CPUs and 512 PIDs. Add `--mount ./dir` to let files persist, or
@@ -105,10 +128,20 @@ dietcode
 ```
 
 One session keeps its conversation and its files — the agent remembers
-what it did on previous turns and the files it built are still there. Slash
-commands: `/help`, `/files`, `/cost`, `/sandbox`, `/clear` (forget the
-conversation, keep the files), `/exit`. Ctrl+C interrupts a turn without
-quitting.
+what it did on previous turns and the files it built are still there. Ctrl+C
+interrupts a turn without quitting.
+
+| Command | |
+| --- | --- |
+| `/help` | the list |
+| `/mode` | how much it may do before asking |
+| `/undo`, `/changes` | put back a file it changed; see what it touched |
+| `/sessions`, `/fork` | past conversations here; branch this one |
+| `/model`, `/provider` | switch either, mid-session |
+| `/cost`, `/files`, `/sandbox` | tokens spent, files here, container info |
+| `/clear` | forget the conversation, keep the files |
+| `/login`, `/logout`, `/auth`, `/doctor` | credentials and setup |
+| `/exit` | quit (also Ctrl+D) |
 
 Or pass a task to run once and exit — used for scripting and the benchmark:
 
@@ -124,12 +157,51 @@ the files to survive:
 dietcode --sandbox --mount ./my-project "add a test for the parser"
 ```
 
+### Sessions
+
+Every conversation is written to a JSONL transcript under
+`~/.dietcode/projects/<project>/` — not into your repo, because a transcript
+holds every file the agent read and every line of shell output.
+
+```bash
+dietcode --continue                # carry on the last conversation here
+dietcode --resume                  # pick one from a list
+dietcode --resume 20260806-1045    # or by id, any unambiguous prefix
+dietcode --fork 20260806-1045      # branch it; the original is untouched
+```
+
+One-shot runs are sessions too, so `dietcode "do a thing"` then
+`dietcode --continue` works. `--no-save` writes nothing.
+
+### Making it prove it is done
+
+```bash
+dietcode --verify "python -m pytest -q" "fix the failing parser test"
+```
+
+`task_complete` then does not end the run until that command exits 0. A failure
+goes back to the model with its output. Without it, "done" is the model's
+opinion.
+
+### What it remembers
+
+On your first prompt in a project with no instructions file, dietcode creates
+`DIETCODE.md` — standing instructions prepended to every session. Fill it in and
+every run picks it up. It also keeps its own notes in
+`~/.dietcode/projects/<project>/memory/memory.md`, which it may write and you may
+edit; your instructions file stays read-only to it, so a run cannot rewrite its
+own brief.
+
 | Flag | Meaning |
 | --- | --- |
+| `--mode manual\|accept-edits\|plan\|auto` | how much it does before asking |
+| `--verify CMD` | command that must exit 0 before it may finish |
+| `--continue` / `--resume [ID]` / `--fork ID` | session handling |
+| `--no-save` / `--no-snapshots` / `--no-notes` | turn off transcripts / undo / notes |
 | `--steps` | show step separators |
 | `--no-stream` | wait for each reply instead of showing it as it is generated |
 | `--subagents` | let the agent delegate self-contained work to sub-agents |
-| `--no-context` | ignore the project's `DIETCODE.md` / `AGENTS.md` |
+| `--no-context` | ignore the project's `DIETCODE.md` / `AGENTS.md` / `CLAUDE.md` |
 | `--provider groq\|gemini\|openai` | which API to use (default: your saved login) |
 | `--base-url URL` | any OpenAI-compatible endpoint (Ollama, vLLM, OpenRouter) |
 | `--no-network` | cut the sandbox off from the network entirely |

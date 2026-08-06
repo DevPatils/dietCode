@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import stat
@@ -346,3 +347,42 @@ def test_a_piped_run_reports_the_error_instead_of_prompting(first_run, monkeypat
     monkeypatch.setattr(first_run.sys.stdin, "isatty", lambda: False, raising=False)
     monkeypatch.setattr(first_run, "confirm", lambda *_a, **_k: pytest.fail("prompted"))
     assert first_run.main(["--provider", "groq", "hello"]) == 2
+
+
+# -- the parser itself ------------------------------------------------------
+
+
+def test_no_two_flags_share_a_destination():
+    """--no-memory once shared `dest` with the container's --memory cap, so
+    `dietcode --sandbox` passed memory=True to Docker instead of "2g" -- and
+    the collision was invisible until both appeared in the same table."""
+    from collections import Counter
+
+    from agent.cli import build_parser
+
+    seen = Counter()
+    for action in build_parser()._actions:
+        if action.dest in ("help", "version", argparse.SUPPRESS):
+            continue
+        # Aliases of one flag are fine; two separate flags are not.
+        seen[action.dest] += 1
+
+    shared = [dest for dest, n in seen.items() if n > 1]
+    assert shared == [], f"these flags write to the same place: {shared}"
+
+
+def test_the_container_memory_cap_survives_the_notes_flag():
+    from agent.cli import build_parser
+
+    args = build_parser().parse_args(["--no-notes"])
+    assert args.memory == "2g", "the container cap must not be clobbered"
+    assert args.notes is False
+
+
+def test_the_old_no_memory_spelling_still_works():
+    """It shipped in 0.6.0; renaming it must not break anyone's command."""
+    from agent.cli import build_parser
+
+    args = build_parser().parse_args(["--no-memory"])
+    assert args.notes is False
+    assert args.memory == "2g"
