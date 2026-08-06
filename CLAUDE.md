@@ -1,8 +1,14 @@
-# DIETCODE.md
+# CLAUDE.md
 
-Standing instructions for any coding agent working in this repository -- dietcode
-reads this file first, and Claude Code reads it too. `CLAUDE.md` is deliberately
-absent: this project's own convention is DIETCODE.md, so it dogfoods it.
+Standing instructions for any coding agent working in this repository. Claude Code
+loads this file by name; dietcode finds it too, third in `CONTEXT_FILES` after
+`DIETCODE.md` and `AGENTS.md`.
+
+Note the asymmetry: dietcode *creates* `DIETCODE.md` for a project that has no
+instructions file, but this repo keeps `CLAUDE.md`, because Claude Code is what
+works on it. Only one of these files should ever exist here -- two copies drift,
+and `load_project_context` stops at the first one it finds, so the other would be
+silently ignored.
 
 ## What this is
 
