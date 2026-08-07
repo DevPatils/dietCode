@@ -1,4 +1,4 @@
-# CLI Coding Agent
+# Diet Code
 
 A command-line coding agent: an agentic loop with tool-calling that reads and
 writes files and runs shell commands until a task is done, in the directory you
