@@ -813,3 +813,135 @@ def test_a_burst_limit_is_still_retried():
     assert not is_quota_exhausted(
         RuntimeError("429 rate limit reached, please try again in 12.5s")
     )
+
+
+# -- /sessions as a picker ---------------------------------------------------
+
+
+@pytest.fixture
+def saved_sessions(session, tmp_path, monkeypatch):
+    """Two transcripts on disk, and a Session pointed at that project."""
+    import os
+    import time
+
+    from agent import sessions as sessions_mod
+
+    monkeypatch.setenv("DIETCODE_HOME", str(tmp_path / "home"))
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setattr(session, "_project_root", lambda: str(project))
+
+    metas = []
+    for i, prompt in enumerate(["the older task", "the newer task"]):
+        store = sessions_mod.SessionStore(project=str(project), model=f"model-{i}")
+        store.record_turn([{"role": "user", "content": prompt}], steps=1)
+        os.utime(store.path, (time.time() + i, time.time() + i))
+        metas.append(sessions_mod.describe(store.path))
+    return session, list(reversed(metas))  # newest first, as the picker lists them
+
+
+def test_picking_a_session_swaps_the_conversation(saved_sessions, monkeypatch):
+    """A printed list makes you leave the session to resume one; picking
+    carries on from it in place."""
+    sess, metas = saved_sessions
+    older = metas[-1]
+
+    monkeypatch.setattr("agent.repl.interactive", lambda: True)
+    monkeypatch.setattr("agent.repl.choose", lambda *a, **k: older.session_id)
+    sess.handle_command("/sessions")
+
+    assert sess.store.session_id == older.session_id
+    assert [m["content"] for m in sess.history] == ["the older task"]
+
+
+def test_a_resumed_session_does_not_rewrite_its_own_history(saved_sessions, monkeypatch):
+    """The loop hands back the whole conversation every turn, so a store that
+    thinks it wrote nothing appends the history a second time."""
+    from agent.sessions import load_messages
+
+    sess, metas = saved_sessions
+    monkeypatch.setattr("agent.repl.interactive", lambda: True)
+    monkeypatch.setattr("agent.repl.choose", lambda *a, **k: metas[-1].session_id)
+    sess.handle_command("/sessions")
+
+    sess.store.record_turn(sess.history)  # a turn that added nothing new
+    assert len(load_messages(sess.store.path)) == 1
+
+
+def test_the_picker_opens_on_the_session_you_are_in(saved_sessions, monkeypatch):
+    sess, metas = saved_sessions
+    seen = {}
+
+    def fake_choose(_console, _title, choices, **kwargs):
+        seen["selected"] = kwargs.get("selected")
+        seen["hints"] = {c.value: c.hint for c in choices}
+        return None
+
+    from agent.sessions import SessionStore
+
+    sess.store = SessionStore(project="x", session_id=metas[0].session_id)
+    monkeypatch.setattr("agent.repl.interactive", lambda: True)
+    monkeypatch.setattr("agent.repl.choose", fake_choose)
+    sess.handle_command("/sessions")
+
+    assert seen["selected"] == metas[0].session_id
+    assert "this one" in seen["hints"][metas[0].session_id]
+
+
+def test_cancelling_the_picker_keeps_the_current_conversation(saved_sessions, monkeypatch):
+    sess, _metas = saved_sessions
+    sess.history = [{"role": "user", "content": "keep me"}]
+
+    monkeypatch.setattr("agent.repl.interactive", lambda: True)
+    monkeypatch.setattr("agent.repl.choose", lambda *a, **k: None)
+    sess.handle_command("/sessions")
+
+    assert [m["content"] for m in sess.history] == ["keep me"]
+
+
+def test_picking_the_session_you_are_already_in_is_a_no_op(saved_sessions, monkeypatch):
+    from agent.sessions import SessionStore
+
+    sess, metas = saved_sessions
+    sess.store = SessionStore(project="x", session_id=metas[0].session_id)
+    sess.history = [{"role": "user", "content": "untouched"}]
+
+    monkeypatch.setattr("agent.repl.interactive", lambda: True)
+    monkeypatch.setattr("agent.repl.choose", lambda *a, **k: metas[0].session_id)
+    sess.handle_command("/sessions")
+
+    assert [m["content"] for m in sess.history] == ["untouched"]
+    assert "already in this session" in output(sess.console)
+
+
+def test_resuming_says_when_the_conversation_ran_on_another_model(
+    saved_sessions, monkeypatch
+):
+    """The transcript is portable, but the next turn runs on what is selected."""
+    sess, metas = saved_sessions
+    sess.model = "something-else"
+
+    monkeypatch.setattr("agent.repl.interactive", lambda: True)
+    monkeypatch.setattr("agent.repl.choose", lambda *a, **k: metas[-1].session_id)
+    sess.handle_command("/sessions")
+
+    text = output(sess.console)
+    assert "stays on something-else" in text
+
+
+def test_without_a_terminal_it_still_prints_the_list(saved_sessions, monkeypatch):
+    sess, _metas = saved_sessions
+    monkeypatch.setattr("agent.repl.interactive", lambda: False)
+    monkeypatch.setattr(
+        "agent.repl.choose", lambda *a, **k: pytest.fail("must not prompt")
+    )
+    sess.handle_command("/sessions")
+
+    assert "the newer task" in output(sess.console)
+
+
+def test_a_project_with_no_sessions_says_so(session, tmp_path, monkeypatch):
+    monkeypatch.setenv("DIETCODE_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(session, "_project_root", lambda: str(tmp_path / "empty"))
+    session.handle_command("/sessions")
+    assert "no saved sessions" in output(session.console)

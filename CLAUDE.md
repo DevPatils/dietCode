@@ -278,13 +278,20 @@ Not in the project directory, for the reason credentials are not: a transcript c
 every file the agent read and every line of shell output. A directory in the repo is a
 directory that gets committed.
 
+`/sessions` picks one and swaps the conversation in place, rather than printing
+ids to paste into a fresh `--resume`. The project directory is passed into `Session`
+rather than derived from the executor: only `PermissionGate` carries `root`, so in
+sandbox mode deriving it fell back to the process cwd and `/sessions` could list a
+different directory than `--resume` keyed off.
+
 **Append-only, one message per line.** A single JSON document rewritten each turn loses
 the whole conversation to one interrupted write; with JSONL a killed session is readable
 up to its last complete line, and `load_messages` skips a torn tail. Only the new tail
 is appended each turn, because the loop hands back the entire conversation every time, so
 re-writing all of it would grow the file quadratically. **A resumed session must set
 `_written` to what is already on disk**, or turn two writes the whole history a second
-time.
+time -- `SessionStore.resuming()` is the one place that does it, for both `--resume`
+and `/sessions`.
 
 **Instructions the user owns, memory the agent owns.** `DIETCODE.md` is scaffolded on
 the *first prompt* of a project that has no instructions file: from the host, before

@@ -106,6 +106,31 @@ class SessionStore:
         self._wrote_header = False
         self._written = 0
 
+    @classmethod
+    def resuming(
+        cls,
+        project: str,
+        meta: SessionMeta,
+        model: str = "",
+        provider: str = "",
+    ) -> tuple[SessionStore, list[dict[str, Any]]]:
+        """A writer for a session that already exists, plus its messages.
+
+        The `_written` bookkeeping is the whole point: the loop hands back the
+        entire conversation every turn, so a resumed store that thinks it has
+        written nothing appends the whole history a second time.
+        """
+        store = cls(
+            project=project,
+            session_id=meta.session_id,
+            model=model or meta.model,
+            provider=provider or meta.provider,
+        )
+        messages = load_messages(meta.path)
+        store._written = len(messages)
+        store._wrote_header = True
+        return store, messages
+
     @property
     def path(self) -> Path:
         return project_dir(self.project) / f"{self.session_id}.jsonl"

@@ -365,17 +365,9 @@ def resolve_session(
         return None, history
 
     if target is not None:
-        store = SessionStore(
-            project=project,
-            session_id=target.session_id,
-            model=model,
-            provider=args.provider or default_provider(),
+        store, history = SessionStore.resuming(
+            project, target, model=model, provider=args.provider or default_provider()
         )
-        history = load_messages(target.path)
-        # Already on disk; without this the whole conversation is appended a
-        # second time on the next turn.
-        store._written = len(history)
-        store._wrote_header = True
         console.print(
             f"[dim]resumed {target.session_id} {len(history)} messages[/dim]"
         )
@@ -668,6 +660,7 @@ def main(argv: list[str] | None = None) -> int:
             store=store,
             history=history,
             snapshots=snapshots,
+            project=str(Path(args.workdir).resolve()),
             scaffold_context=getattr(args, "context", True) and not wants_sandbox(args),
         ).run()
     finally:

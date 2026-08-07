@@ -155,6 +155,7 @@ class Session:
         history: list[dict[str, Any]] | None = None,
         scaffold_context: bool = True,
         snapshots: SnapshotStore | None = None,
+        project: str | None = None,
     ):
         self.context_budget = context_budget
         self.max_total_tokens = max_total_tokens
@@ -177,6 +178,11 @@ class Session:
         self.store = store
         self.scaffold_context = scaffold_context
         self.snapshots = snapshots
+        # Passed in rather than derived, so /sessions and --resume key off
+        # the same directory. Only PermissionGate carries `root`, so in
+        # sandbox mode deriving it fell back to the process cwd, which is
+        # not necessarily --workdir.
+        self.project = project
         self.total_tokens = 0
         self.total_steps = 0
         self.turns = 0
@@ -414,9 +420,21 @@ class Session:
     # -- sessions -----------------------------------------------------------
 
     def _project_root(self) -> str:
-        return str(getattr(self.executor, "root", None) or Path.cwd())
+        if self.project:
+            return self.project
+        return str(
+            getattr(self.executor, "root", None)
+            or getattr(self.executor, "workdir", None)
+            or Path.cwd()
+        )
 
     def _cmd_sessions(self, _args: list[str]) -> None:
+        """Pick a past conversation and carry on from it.
+
+        A printed list still needs the id copied into a fresh `dietcode
+        --resume`, which means leaving the session you are already in. Picking
+        one here swaps the conversation in place.
+        """
         rows = list_sessions(self._project_root())
         if not rows:
             self.console.print(
@@ -424,20 +442,84 @@ class Session:
             )
             return
 
+        current = self.store.session_id if self.store else None
+        if not interactive():
+            self._print_sessions(rows, current)
+            return
+
+        chosen = choose(
+            self.console,
+            "Sessions in this project",
+            [
+                Choice(
+                    meta.session_id,
+                    meta.session_id,
+                    f"{meta.turns} turn(s)  {meta.label}"
+                    + ("   (this one)" if meta.session_id == current else ""),
+                )
+                for meta in rows
+            ],
+            selected=current,
+        )
+        if chosen is None:
+            self.console.print()
+            return
+        if chosen == current:
+            self.console.print(f"[{MUTED}]already in this session[/{MUTED}]\n")
+            return
+        self._resume(next(m for m in rows if m.session_id == chosen))
+
+    def _print_sessions(self, rows: list[Any], current: str | None) -> None:
         table = Table(show_header=True, box=None, padding=(0, 2))
         table.add_column("session", style=NOTE)
         table.add_column("turns", style=MUTED, justify="right")
         table.add_column("model", style=MUTED)
         table.add_column("first prompt", style=OUTPUT)
         for meta in rows:
-            current = self.store is not None and meta.session_id == self.store.session_id
-            marker = f" [{BRAND}]{glyph('bullet')}[/{BRAND}]" if current else ""
-            table.add_row(f"{meta.session_id}{marker}", str(meta.turns), meta.model, meta.label)
+            marker = (
+                f" [{BRAND}]{glyph('bullet')}[/{BRAND}]"
+                if meta.session_id == current
+                else ""
+            )
+            table.add_row(
+                f"{meta.session_id}{marker}", str(meta.turns), meta.model, meta.label
+            )
         self.console.print(table)
         self.console.print(
             f"[{MUTED}]resume one with [/{MUTED}][{TOOL}]dietcode --resume <id>[/{TOOL}]"
             f"[{MUTED}] {glyph('dot')} {glyph('bullet')} is this session[/{MUTED}]\n"
         )
+
+    def _resume(self, meta: Any) -> None:
+        """Swap this session's conversation for a saved one.
+
+        The transcript being append-only is what makes this safe: the session
+        being left is already written to disk, so switching loses nothing and
+        switching back is another pick.
+        """
+        store, history = SessionStore.resuming(
+            self._project_root(), meta, model=self.model, provider=self.provider
+        )
+        self.store, self.history = store, history
+        self.console.print(
+            f"[{NOTE}]resumed {meta.session_id}[/{NOTE}] "
+            f"[{MUTED}]{glyph('dash')} {len(history)} messages[/{MUTED}]"
+        )
+        if meta.model and meta.model != self.model:
+            # Worth saying out loud: the conversation came from elsewhere, but
+            # the next turn runs on whatever is selected now.
+            self.console.print(
+                f"[{MUTED}]it ran on {meta.model}; this session stays on "
+                f"{self.model}[/{MUTED}]"
+            )
+        if self.snapshots and self.snapshots.changes:
+            # /undo reverts what this process changed, which is not the same
+            # set as what the resumed conversation describes.
+            self.console.print(
+                f"[{MUTED}]/undo still covers the {len(self.snapshots.changes)} "
+                f"file change(s) made in this run[/{MUTED}]"
+            )
+        self.console.print()
 
     def _cmd_fork(self, _args: list[str]) -> None:
         """Branch here, so the current conversation can be taken two ways."""
