@@ -24,7 +24,13 @@ classifiers = [
 ]
 
 dependencies = [
+    # One SDK per provider. All four are required rather than optional extras:
+    # picking a provider and being told to go install something is a worse
+    # first run than a slightly larger install.
     "openai>=1.40.0",
+    "groq>=0.11.0",
+    "google-genai>=1.0.0",
+    "anthropic>=0.40.0",
     "rich>=13.0.0",
     "prompt_toolkit>=3.0.0",
     # Stores API keys in the OS keychain. Falls back to a 0600 file when the

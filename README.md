@@ -2,8 +2,8 @@
 
 A command-line coding agent: an agentic loop with tool-calling that reads and
 writes files and runs shell commands until a task is done, in the directory you
-are standing in, asking before each change. No agent framework, just raw
-OpenAI-compatible API calls and a hand-rolled loop.
+are standing in, asking before each change. No agent framework, just each
+provider's own SDK and a hand-rolled loop.
 
 Benchmarked against Terminal-Bench.
 
@@ -41,8 +41,11 @@ Keychain, Secret Service on Linux), falling back to a `0600` file at
 | `groq` | yes, generous | [console.groq.com/keys](https://console.groq.com/keys) |
 | `gemini` | yes | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | `openai` | no | [platform.openai.com](https://platform.openai.com/api-keys) |
+| `anthropic` | no | [console.anthropic.com](https://console.anthropic.com/settings/keys) |
 
-Any OpenAI-compatible endpoint works via `--base-url` (Ollama, vLLM, OpenRouter).
+Each runs on its own SDK, so nothing is squeezed through a compatibility
+layer. Any OpenAI-compatible endpoint also works via `--base-url` (Ollama,
+vLLM, OpenRouter).
 
 Now run it from anywhere:
 
@@ -187,7 +190,7 @@ own brief.
 | `--no-stream` | wait for each reply instead of showing it as it is generated |
 | `--subagents` | let the agent delegate self-contained work to sub-agents |
 | `--no-context` | ignore the project's `DIETCODE.md` / `AGENTS.md` / `CLAUDE.md` |
-| `--provider groq\|gemini\|openai` | which API to use (default: your saved login) |
+| `--provider groq\|gemini\|openai\|anthropic` | which API to use (default: your saved login) |
 | `--base-url URL` | any OpenAI-compatible endpoint (Ollama, vLLM, OpenRouter) |
 | `--max-tokens N` | hard spend ceiling per task |
 | `--context-budget N` | trim the oldest turns above this prompt size (default 48000) |

@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from .providers import Completion, make_transport
 from .sandbox import Executor
 from .tools import TOOLS, execute_tool, extract_tool_calls_from_text
 
@@ -239,27 +240,43 @@ def make_client(
     api_key: str | None = None,
     base_url: str = GROQ_BASE_URL,
     timeout: float = REQUEST_TIMEOUT,
+    provider: str | None = None,
 ) -> Any:
-    """Every supported provider speaks the OpenAI protocol, so one client and a
-    different base_url covers all of them."""
-    from openai import OpenAI
+    """Build the transport for a provider.
 
+    Each provider is driven by its own SDK, so this returns a Transport rather
+    than a bare client. `provider` is inferred from `base_url` when the caller
+    does not say, which keeps the older two-argument form working.
+    """
     key = api_key or os.environ.get("GROQ_API_KEY")
     if not key:
         raise RuntimeError(
             "No API key. Run `dietcode login` to save one, "
             "or set an API key environment variable."
         )
-    return OpenAI(
-        api_key=key,
-        base_url=base_url,
-        # The SDK defaults to a 600s timeout, so one hung request can stall a
-        # benchmark task for ten minutes and then fail anyway.
-        timeout=timeout,
-        # Retries are ours: _call_llm classifies the error and backs off, and
-        # the SDK retrying underneath would multiply the wait invisibly.
-        max_retries=0,
+
+    if provider is None:
+        provider = _provider_for(base_url)
+
+    # A custom endpoint means someone is pointing at Ollama, vLLM or
+    # OpenRouter, all of which serve the OpenAI protocol whatever the provider
+    # setting says.
+    custom = base_url and provider in ("openai", "groq") and base_url != GROQ_BASE_URL
+    return make_transport(
+        provider, key, base_url=base_url if custom else None, timeout=timeout
     )
+
+
+def _provider_for(base_url: str) -> str:
+    """Which provider a base_url belongs to, for callers that pass only a URL."""
+    host = (base_url or "").lower()
+    if "groq.com" in host:
+        return "groq"
+    if "googleapis.com" in host or "generativelanguage" in host:
+        return "gemini"
+    if "anthropic.com" in host:
+        return "anthropic"
+    return "openai"
 
 
 # Fields a provider attaches to a tool call that are not part of the OpenAI
@@ -488,19 +505,6 @@ def _is_transient(exc: Exception) -> bool:
     )
 
 
-@dataclass
-class Completion:
-    """One model turn, however it arrived.
-
-    Streaming and non-streaming are normalized to this so the loop never has to
-    care which transport produced the turn.
-    """
-
-    content: str = ""
-    tool_calls: list[dict[str, Any]] = field(default_factory=list)
-    usage: Any = None
-
-
 def _from_response(response: Any) -> Completion:
     message = response.choices[0].message
     raw_calls = getattr(message, "tool_calls", None) or []
@@ -598,8 +602,22 @@ def _call_llm(
     last_exc: Exception | None = None
     include_usage = True
 
+    # A Transport owns its provider's SDK, its message conversion and its own
+    # notion of which failures are worth retrying. Anything else is treated as
+    # a raw OpenAI-protocol client, which is what the test suite's scripted
+    # fake is, and what `--base-url` used to hand in.
+    transport = client if hasattr(client, "complete") else None
+
     for attempt in range(max_retries):
         try:
+            if transport is not None:
+                return transport.complete(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    stream=stream,
+                    on_text=on_text,
+                )
             kwargs: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
@@ -630,10 +648,18 @@ def _call_llm(
 
             # A daily cap will not clear during this run; fail immediately so
             # the caller sees the reason instead of a timeout.
-            if is_quota_exhausted(exc):
+            exhausted = (
+                transport.is_quota_exhausted(exc)
+                if transport is not None
+                else is_quota_exhausted(exc)
+            )
+            if exhausted:
                 raise
 
-            if not _is_transient(exc) or attempt == max_retries - 1:
+            transient = (
+                transport.is_transient(exc) if transport is not None else _is_transient(exc)
+            )
+            if not transient or attempt == max_retries - 1:
                 raise
             # A stream that failed part-way has already shown the user some
             # text; retrying will repeat it. Rare enough to accept.

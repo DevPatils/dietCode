@@ -62,6 +62,12 @@ FALLBACK_MODELS: dict[str, tuple[str, ...]] = {
         "gpt-4o-mini",
         "gpt-4o",
     ),
+    "anthropic": (
+        "claude-sonnet-5",
+        "claude-opus-5",
+        "claude-haiku-4-5-20251001",
+        "claude-fable-5",
+    ),
 }
 
 
@@ -79,11 +85,15 @@ def _normalize(model_id: str) -> str:
 def list_models(client: Any, provider: str) -> tuple[list[str], str | None]:
     """(model ids, error). Never raises -- a picker must always have options."""
     try:
-        response = client.models.list()
-        raw = [
-            _normalize(str(getattr(item, "id", "") or ""))
-            for item in getattr(response, "data", None) or response
-        ]
+        if hasattr(client, "list_models"):
+            # A transport knows its own SDK's listing call; only it does.
+            raw = [_normalize(m) for m in client.list_models()]
+        else:
+            response = client.models.list()
+            raw = [
+                _normalize(str(getattr(item, "id", "") or ""))
+                for item in getattr(response, "data", None) or response
+            ]
     except Exception as exc:  # noqa: BLE001 - any failure falls back to the list
         return list(FALLBACK_MODELS.get(provider, ())), str(exc)
 

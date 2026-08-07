@@ -283,7 +283,9 @@ class Session:
                 f"[{MUTED}]{glyph('dash')} run /login {spec.name}[/{MUTED}]\n"
             )
             return False
-        self.client = make_client(api_key=api_key, base_url=spec.base_url)
+        self.client = make_client(
+            api_key=api_key, base_url=spec.base_url, provider=self.provider
+        )
         # The tool schemas are provider-specific: what Groq needs, Gemini
         # rejects. Switching provider mid-session has to re-narrow them, or the
         # next turn 400s on a schema built for the provider we just left.

@@ -50,7 +50,9 @@ PROVIDERS: dict[str, Provider] = {
     "gemini": Provider(
         name="gemini",
         label="Google Gemini",
-        # Gemini speaks the OpenAI protocol at this path, so the same client works.
+        # Kept for reference and for `dietcode auth`. The Gemini transport
+        # uses google-genai, which builds its own endpoint, so this is not
+        # the URL requests actually go to.
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         # An alias, not a pinned version. Google retires model ids and gates
         # older ones to existing accounts, so a hardcoded `gemini-2.5-flash`
@@ -74,6 +76,18 @@ PROVIDERS: dict[str, Provider] = {
         env_var="OPENAI_API_KEY",
         signup_url="https://platform.openai.com/api-keys",
         key_hint="sk-",
+    ),
+    "anthropic": Provider(
+        name="anthropic",
+        label="Anthropic",
+        base_url="https://api.anthropic.com",
+        # Sonnet rather than Opus: this loop makes one request per step and
+        # there is no free tier here, so the default should be the one you can
+        # afford to leave running. `/model` reaches the rest.
+        default_model="claude-sonnet-5",
+        env_var="ANTHROPIC_API_KEY",
+        signup_url="https://console.anthropic.com/settings/keys",
+        key_hint="sk-ant-",
     ),
 }
 

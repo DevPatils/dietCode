@@ -603,7 +603,11 @@ def main(argv: list[str] | None = None) -> int:
         console.print()
 
     try:
-        client = make_client(api_key=api_key, base_url=base_url)
+        client = make_client(
+            api_key=api_key,
+            base_url=base_url,
+            provider=args.provider or default_provider(),
+        )
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         return 2

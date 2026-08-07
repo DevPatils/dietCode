@@ -80,6 +80,11 @@ turn's `.messages` back in as `history`, which is the *only* behavioural differe
 `history` is copied, not mutated, so an interrupted turn cannot leave the caller with
 a transcript containing unanswered tool calls (which the API rejects).
 
+`agent/providers/` holds one transport per provider, each on that provider's own SDK:
+`groq_api.py`, `openai_api.py`, `gemini_api.py`, `anthropic_api.py`. `_openai_shape.py`
+is the response reassembly the first two share, since they differ in package and
+exception hierarchy but not in wire format. `make_client` returns a transport.
+
 Everything that reads a keypress lives in `agent/prompts.py` (pickers, confirm, secret
 entry) and `agent/completion.py` (slash completion). `agent/models.py` asks a provider
 what it will actually accept, filtering `/models` down to ids that can drive a
@@ -91,10 +96,10 @@ aware of a terminal breaks that.
 
 **Streaming is opt-in (`stream=True`), and the benchmark deliberately leaves it off.**
 Streaming requires reassembling tool calls from fragments, which is more machinery to go wrong,
-for output no scored run watches. Both transports normalize to `Completion(content,
-tool_calls, usage)` in `_from_response` / `_from_stream`, so the loop body is transport-
-agnostic. When adding a field to a model turn, add it to `Completion` and to *both*
-constructors, or streamed runs silently lose it.
+for output no scored run watches. Every transport, streamed or not, normalizes to
+`Completion(content, tool_calls, usage)`, so the loop body never learns which provider
+answered. When adding a field to a model turn, add it to `Completion` and to every
+transport that can produce one, or the providers you did not touch silently lose it.
 
 Reassembly gotchas, each covered by a test in `tests/test_streaming.py`: tool-call
 fragments are keyed by `index` (several calls stream interleaved); the function name is
@@ -203,12 +208,22 @@ These encode failures already hit; changing them will silently break runs.
   prints, and `ui.glyph()` falls back to ASCII when the encoding is narrow. The same
   applies to rich's box-drawing: `banner()` picks `box.ASCII` from `ascii_only()`
   rather than trusting rich's terminal detection.
-- **Tool schemas are narrowed per provider on the way out** (`tools_for`). The union
-  types (`["integer","string"]`) exist because Groq validates the model's arguments
-  server-side; Gemini's schema layer is OpenAPI-derived and cannot express a union at
-  all. So `TOOLS` stays canonical and each provider gets its own shape. `_rebuild_client`
-  re-narrows on `/provider`, or the next turn 400s on a schema built for the provider
-  just left.
+- **One transport per provider, in `agent/providers/`, each on that provider's own
+  SDK.** The loop and the JSONL transcript speak one format, the OpenAI shape, and
+  everything a provider does differently is converted at that boundary and nowhere
+  else. That is what keeps `/provider` switchable mid-conversation and a session
+  recorded on one provider resumable on another. If Anthropic's content blocks or
+  Gemini's Parts leak upward, a transcript is only replayable by whoever wrote it.
+- **Gemini's `thought_signature` must round-trip through the transcript.** Gemini 3
+  rejects turn two without the signature it issued, it lives on the `Part` rather than
+  the `FunctionCall`, and it arrives as raw bytes, so it is base64'd to survive being
+  saved and resumed. This has bitten twice: once on the OpenAI-compat endpoint, once
+  again on the native SDK.
+- **Tool schemas are still narrowed per provider on the way out** (`tools_for`). The
+  union types (`["integer","string"]`) exist because Groq validates the model's
+  arguments server-side. The native Gemini transport passes raw JSON Schema via
+  `parameters_json_schema` and no longer needs the narrowing, but `TOOLS` stays
+  canonical and the narrowing stays harmless.
 - **Anything the user types at a prompt must be echoed by prompt_toolkit, not
   `input()`.** `input()` writes straight to the terminal while rich is still repainting
   a spinner over the same line, so the keystrokes vanish and the user answers the
@@ -228,9 +243,8 @@ These encode failures already hit; changing them will silently break runs.
 
 ## Constraints from the plan
 
-- **No agent framework**: raw OpenAI-compatible calls against Groq
-  (`https://api.groq.com/openai/v1`), model `llama-3.3-70b-versatile`, fallback
-  `qwen/qwen3-32b` only if tool-calling is worse on the primary.
+- **No agent framework**: a hand-rolled loop over each provider's own SDK. The
+  primary is Groq, model `llama-3.3-70b-versatile`.
 - **Keep `max_iterations` at 10 to 15.** Groq's free tier is ~1,000 requests/day and each
   loop step is one request.
 - **Never run the full 89-task suite while iterating**: a fixed 15 to 20 task subset.

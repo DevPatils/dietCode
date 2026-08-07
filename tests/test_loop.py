@@ -231,14 +231,25 @@ def test_per_minute_limits_are_still_retried(executor, monkeypatch):
     assert burst.attempts == MAX_LLM_RETRIES
 
 
-def test_client_bounds_request_time_and_owns_its_retries(monkeypatch):
-    """The SDK defaults to a 600s timeout and its own retries; one hung request
-    would otherwise stall a benchmark task for ten minutes, and SDK retries
-    would silently multiply our backoff."""
-    monkeypatch.setenv("GROQ_API_KEY", "test-key")
-    client = make_client()
-    assert client.timeout == REQUEST_TIMEOUT
-    assert client.max_retries == 0
+@pytest.mark.parametrize("provider", ["groq", "openai", "anthropic"])
+def test_every_sdk_is_bounded_and_owns_no_retries(provider):
+    """Each SDK defaults to a long timeout and its own retries; one hung
+    request would stall a benchmark task for ten minutes, and SDK retries would
+    silently multiply the loop's backoff.
+
+    Gemini is checked separately: google-genai configures both through
+    http_options rather than on the client.
+    """
+    transport = make_client(api_key="test-key", provider=provider)
+    assert transport._client.timeout == REQUEST_TIMEOUT
+    assert transport._client.max_retries == 0
+
+
+def test_the_gemini_sdk_is_bounded_too():
+    transport = make_client(api_key="test-key", provider="gemini")
+    options = transport._client._api_client._http_options
+    assert options.timeout == REQUEST_TIMEOUT * 1000  # milliseconds here
+    assert options.retry_options.attempts == 1  # one attempt means no retries
 
 
 # -- the loop actually does work -------------------------------------------

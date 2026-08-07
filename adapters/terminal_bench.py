@@ -49,8 +49,12 @@ except ImportError as exc:  # pragma: no cover - exercised only without the harn
     ) from exc
 
 
-def _credentials() -> tuple[str, str]:
-    """(api_key, base_url) for whichever provider is configured."""
+def _credentials() -> tuple[str, str, str]:
+    """(api_key, base_url, provider) for whichever provider is configured.
+
+    The provider name is returned too, because each one is driven by its own
+    SDK now and the base_url alone no longer identifies which.
+    """
     provider = default_provider()
     spec = get_provider(provider)
     api_key, _source = resolve_key(provider)
@@ -59,7 +63,7 @@ def _credentials() -> tuple[str, str]:
             f"no API key for {spec.label}. Run `dietcode login {spec.name}` "
             f"or set ${spec.env_var}."
         )
-    return api_key, spec.base_url
+    return api_key, spec.base_url, provider
 
 
 class SessionExecutor(DockerExecutor):
@@ -158,8 +162,10 @@ class CliAgent(BaseAgent):
             # Resolve through the same credential path the CLI uses, so a
             # `dietcode login` is enough to run the benchmark -- tb does not
             # load .env and exporting a key per shell is easy to forget.
-            api_key, base_url = _credentials()
-            client = make_client(api_key=api_key, base_url=base_url)
+            api_key, base_url, provider = _credentials()
+            client = make_client(
+                api_key=api_key, base_url=base_url, provider=provider
+            )
         except (AuthError, RuntimeError) as exc:
             # Almost always a missing GROQ_API_KEY. Surface it -- otherwise every
             # task in the run fails identically with no visible reason.

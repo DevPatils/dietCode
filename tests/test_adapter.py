@@ -156,16 +156,20 @@ def test_the_benchmark_uses_the_same_saved_login_as_the_cli(monkeypatch, tmp_pat
     auth.store_key("gemini", "AIza_saved")
     auth.set_default_provider("gemini")
 
-    api_key, base_url = adapter._credentials()
+    api_key, base_url, provider = adapter._credentials()
     assert api_key == "AIza_saved"
     assert "generativelanguage" in base_url
+    # The provider name is what picks the SDK now; base_url alone no longer
+    # identifies which transport to build.
+    assert provider == "gemini"
 
 
 def test_completed_task_reports_tokens_and_no_failure(session, tmp_path, monkeypatch):
     from agent.loop import AgentResult as LoopResult
 
     monkeypatch.setattr(
-        "adapters.terminal_bench._credentials", lambda: ("test-key", "http://x/v1")
+        "adapters.terminal_bench._credentials",
+        lambda: ("test-key", "http://x/v1", "groq"),
     )
     monkeypatch.setattr("adapters.terminal_bench.make_client", lambda **kw: object())
     monkeypatch.setattr(
@@ -200,7 +204,8 @@ def test_status_maps_to_failure_mode(session, monkeypatch, status, expected):
     from agent.loop import AgentResult as LoopResult
 
     monkeypatch.setattr(
-        "adapters.terminal_bench._credentials", lambda: ("test-key", "http://x/v1")
+        "adapters.terminal_bench._credentials",
+        lambda: ("test-key", "http://x/v1", "groq"),
     )
     monkeypatch.setattr("adapters.terminal_bench.make_client", lambda **kw: object())
     monkeypatch.setattr(
